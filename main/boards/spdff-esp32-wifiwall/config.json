@@ -1,0 +1,13 @@
+{
+    "target": "esp32",
+    "builds": [
+        {
+            "name": "spdff-esp32-wifiwall",
+            "sdkconfig_append": [
+                "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v1/4m.csv\"",
+                "LCD_ST7735_128X128_WIFIWALL=y"
+            ]
+        }
+    ]
+}

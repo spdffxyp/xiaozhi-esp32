@@ -19,10 +19,14 @@
 
 #define TAG "Application"
 
-
+/**
+ * 构造函数：初始化事件组、回声消除(AEC)模式和时钟定时器
+ */
 Application::Application() {
+    // 创建 FreeRTOS 事件组，用于主循环的事件分发
     event_group_ = xEventGroupCreate();
 
+    // 根据宏定义配置回声消除 (AEC) 模式
 #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
 #error "CONFIG_USE_DEVICE_AEC and CONFIG_USE_SERVER_AEC cannot be enabled at the same time"
 #elif CONFIG_USE_DEVICE_AEC
@@ -33,6 +37,7 @@ Application::Application() {
     aec_mode_ = kAecOff;
 #endif
 
+    // 创建一个周期性定时器，用于更新 UI 上的系统时钟和状态栏
     esp_timer_create_args_t clock_timer_args = {
         .callback = [](void* arg) {
             Application* app = (Application*)arg;
@@ -54,10 +59,16 @@ Application::~Application() {
     vEventGroupDelete(event_group_);
 }
 
+/**
+ * 切换设备状态（如从待机切换到聆听）
+ */
 bool Application::SetDeviceState(DeviceState state) {
     return state_machine_.TransitionTo(state);
 }
 
+/**
+ * 初始化应用程序：设置显示屏、音频、网络回调和 MCP 服务器
+ */
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
@@ -65,14 +76,17 @@ void Application::Initialize() {
     // Setup the display
     auto display = board.GetDisplay();
 
+    // 在聊天框显示当前设备的 User-Agent 信息（版本号等）
     // Print board name/version info
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
+    // 初始化音频服务（音频输入输出的核心）
     // Setup the audio service
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
 
+    // 设置音频回调，将底层事件转化为应用层事件
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
@@ -85,19 +99,23 @@ void Application::Initialize() {
     };
     audio_service_.SetCallbacks(callbacks);
 
+    // 监听状态机变化，触发 UI 更新
     // Add state change listeners
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
     });
 
+    // 启动 1 秒一次的 UI 刷新定时器
     // Start the clock timer to update the status bar
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
+    // 初始化 MCP 工具（用于 AI 控制本地硬件）
     // Add MCP common tools (only once during initialization)
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
 
+    // 设置网络状态回调：处理 WiFi/蜂窝网的连接、断开及错误显示
     // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
         auto display = Board::GetInstance().GetDisplay();
@@ -156,6 +174,7 @@ void Application::Initialize() {
         }
     });
 
+    // 异步启动网络连接
     // Start network asynchronously
     board.StartNetwork();
 
@@ -163,7 +182,11 @@ void Application::Initialize() {
     display->UpdateStatusBar(true);
 }
 
+/**
+ * 主循环：等待并处理所有注册的事件
+ */
 void Application::Run() {
+    // 监听所有定义在 event_group 中的位
     const EventBits_t ALL_EVENTS = 
         MAIN_EVENT_SCHEDULE |
         MAIN_EVENT_SEND_AUDIO |
@@ -180,13 +203,16 @@ void Application::Run() {
         MAIN_EVENT_STATE_CHANGED;
 
     while (true) {
+        // 阻塞等待事件发生
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
 
+        // 处理错误事件
         if (bits & MAIN_EVENT_ERROR) {
             SetDeviceState(kDeviceStateIdle);
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
         }
 
+        // 网络连接成功后，开始执行激活任务（OTA检查、协议初始化）
         if (bits & MAIN_EVENT_NETWORK_CONNECTED) {
             HandleNetworkConnectedEvent();
         }
@@ -199,6 +225,7 @@ void Application::Run() {
             HandleActivationDoneEvent();
         }
 
+        // 处理状态改变事件（更新 LED、UI 表情等）
         if (bits & MAIN_EVENT_STATE_CHANGED) {
             HandleStateChangedEvent();
         }
@@ -215,6 +242,7 @@ void Application::Run() {
             HandleStopListeningEvent();
         }
 
+        // 发送音频数据：当音频队列有数据时，通过 MQTT/Websocket 发送给服务器
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
@@ -223,6 +251,7 @@ void Application::Run() {
             }
         }
 
+        // 唤醒词检测处理
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
             HandleWakeWordDetectedEvent();
         }
@@ -234,6 +263,7 @@ void Application::Run() {
             }
         }
 
+        // 执行被 Schedule 延迟执行的任务（跨线程任务分发）
         if (bits & MAIN_EVENT_SCHEDULE) {
             std::unique_lock<std::mutex> lock(mutex_);
             auto tasks = std::move(main_tasks_);
@@ -243,6 +273,7 @@ void Application::Run() {
             }
         }
 
+        // 处理定时器滴答：更新状态栏和打印内存状态
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
@@ -256,8 +287,11 @@ void Application::Run() {
     }
 }
 
+/**
+ * 处理网络连接成功的逻辑：启动激活和初始化任务
+ */
 void Application::HandleNetworkConnectedEvent() {
-    ESP_LOGI(TAG, "Network connected");
+    ESP_LOGI(TAG, "Network connected");  // 网络已连接
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -268,6 +302,7 @@ void Application::HandleNetworkConnectedEvent() {
             return;
         }
 
+        // 在新任务中运行激活流程，避免阻塞主循环
         xTaskCreate([](void* arg) {
             Application* app = static_cast<Application*>(arg);
             app->ActivationTask();
@@ -316,18 +351,21 @@ void Application::HandleActivationDoneEvent() {
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 }
 
+/**
+ * 激活任务逻辑：OTA 检查 -> 资源检查 -> 协议初始化
+ */
 void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
     // Check for new assets version
-    CheckAssetsVersion();
+    CheckAssetsVersion(); // 检查图片/音效资源更新
 
     // Check for new firmware version
-    CheckNewVersion();
+    CheckNewVersion();  // 检查固件更新
 
     // Initialize the protocol
-    InitializeProtocol();
+    InitializeProtocol();  // 初始化通讯协议 (MQTT/Websocket)
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
@@ -466,13 +504,16 @@ void Application::CheckNewVersion() {
     }
 }
 
+/**
+ * 初始化通讯协议：设置来自服务器的消息处理逻辑 (核心 AI 交互逻辑)
+ */
 void Application::InitializeProtocol() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     auto codec = board.GetAudioCodec();
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
-
+    // (根据配置创建 MQTT 或 Websocket 实例)
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {
@@ -514,6 +555,7 @@ void Application::InitializeProtocol() {
         });
     });
     
+    // 核心：处理服务器下发的 JSON 消息
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
@@ -535,6 +577,7 @@ void Application::InitializeProtocol() {
                     }
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
+                // 当 AI 开始说一句话时，更新 UI 文字
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
@@ -543,7 +586,9 @@ void Application::InitializeProtocol() {
                     });
                 }
             }
-        } else if (strcmp(type->valuestring, "stt") == 0) {
+        } 
+        // 处理 STT (用户语音识别) 实时文字显示
+        else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
@@ -551,14 +596,18 @@ void Application::InitializeProtocol() {
                     display->SetChatMessage("user", message.c_str());
                 });
             }
-        } else if (strcmp(type->valuestring, "llm") == 0) {
+        } 
+        // 处理 LLM 表情变化
+        else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
                 Schedule([this, display, emotion_str = std::string(emotion->valuestring)]() {
                     display->SetEmotion(emotion_str.c_str());
                 });
             }
-        } else if (strcmp(type->valuestring, "mcp") == 0) {
+        } 
+        // 处理 MCP 工具调用指令
+        else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
             if (cJSON_IsObject(payload)) {
                 McpServer::GetInstance().ParseMessage(payload);
@@ -751,6 +800,9 @@ void Application::HandleStopListeningEvent() {
     }
 }
 
+/**
+ * 处理唤醒词检测事件
+ */
 void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
         return;
@@ -759,6 +811,7 @@ void Application::HandleWakeWordDetectedEvent() {
     auto state = GetDeviceState();
     
     if (state == kDeviceStateIdle) {
+        // 进入连接/聆听状态
         audio_service_.EncodeWakeWord();
 
         if (!protocol_->IsAudioChannelOpened()) {
@@ -776,6 +829,7 @@ void Application::HandleWakeWordDetectedEvent() {
         while (auto packet = audio_service_.PopWakeWordPacket()) {
             protocol_->SendAudio(std::move(packet));
         }
+        // 发送唤醒词给服务器，并进入聆听模式
         // Set the chat state to wake word detected
         protocol_->SendWakeWordDetected(wake_word);
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
@@ -786,6 +840,7 @@ void Application::HandleWakeWordDetectedEvent() {
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
 #endif
     } else if (state == kDeviceStateSpeaking) {
+        // 如果 AI 正在说话，检测到唤醒词则打断说话
         AbortSpeaking(kAbortReasonWakeWordDetected);
     } else if (state == kDeviceStateActivating) {
         // Restart the activation check if the wake word is detected during activation
@@ -793,6 +848,9 @@ void Application::HandleWakeWordDetectedEvent() {
     }
 }
 
+/**
+ * 状态机切换后的副作用处理（UI 更新、硬件控制）
+ */
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
     clock_ticks_ = 0;
@@ -800,15 +858,15 @@ void Application::HandleStateChangedEvent() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     auto led = board.GetLed();
-    led->OnStateChanged();
+    led->OnStateChanged();  // 根据状态改变 LED 颜色/动画
     
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
-            audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            audio_service_.EnableVoiceProcessing(false);  // 停止麦克风编码
+            audio_service_.EnableWakeWordDetection(true);  // 开启唤醒词监听
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -823,8 +881,8 @@ void Application::HandleStateChangedEvent() {
             if (!audio_service_.IsAudioProcessorRunning()) {
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
-                audio_service_.EnableVoiceProcessing(true);
-                audio_service_.EnableWakeWordDetection(false);
+                audio_service_.EnableVoiceProcessing(true);  // 开始麦克风编码发送
+                audio_service_.EnableWakeWordDetection(false);  // 聆听时不监听唤醒词
             }
 
             // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
@@ -841,7 +899,7 @@ void Application::HandleStateChangedEvent() {
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            audio_service_.ResetDecoder();
+            audio_service_.ResetDecoder();  // 准备解码服务器传回的音频
             break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);
@@ -852,6 +910,10 @@ void Application::HandleStateChangedEvent() {
             break;
     }
 }
+
+/**
+ * 跨线程任务分发：确保 lambda 表达式在主线程（Run 所在的线程）执行
+ */
 
 void Application::Schedule(std::function<void()>&& callback) {
     {
@@ -887,6 +949,9 @@ void Application::Reboot() {
     esp_restart();
 }
 
+/**
+ * 固件升级 (OTA) 逻辑
+ */
 bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -901,6 +966,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     }
     ESP_LOGI(TAG, "Starting firmware upgrade from URL: %s", upgrade_url.c_str());
 
+    // 升级前停止音频服务，提升性能并释放内存
     Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download", Lang::Sounds::OGG_UPGRADE);
     vTaskDelay(pdMS_TO_TICKS(3000));
 
@@ -913,6 +979,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     audio_service_.Stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
+    // 执行下载和刷写
     bool upgrade_success = Ota::Upgrade(upgrade_url, [display](int progress, size_t speed) {
         std::thread([display, progress, speed]() {
             char buffer[32];
@@ -924,7 +991,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     if (!upgrade_success) {
         // Upgrade failed, restart audio service and continue running
         ESP_LOGE(TAG, "Firmware upgrade failed, restarting audio service and continuing operation...");
-        audio_service_.Start(); // Restart audio service
+        audio_service_.Start(); // Restart audio service  // 失败则恢复音频服务
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER); // Restore power save level
         Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
         vTaskDelay(pdMS_TO_TICKS(3000));
@@ -934,7 +1001,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
         ESP_LOGI(TAG, "Firmware upgrade successful, rebooting...");
         display->SetChatMessage("system", "Upgrade successful, rebooting...");
         vTaskDelay(pdMS_TO_TICKS(1000)); // Brief pause to show message
-        Reboot();
+        Reboot();   // 成功后重启
         return true;
     }
 }

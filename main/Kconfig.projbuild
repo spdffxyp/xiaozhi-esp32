@@ -450,6 +450,12 @@ choice BOARD_TYPE
     config BOARD_TYPE_HU_087
         bool "HU-087"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_SPDFF_WIFIWALL
+        bool "SPDFF-WifiWall"
+        depends on IDF_TARGET_ESP32
+    config BOARD_TYPE_SPDFF_BOARD
+        bool "SPDFF-BOARD"
+        depends on IDF_TARGET_ESP32S3
 endchoice
 
 choice

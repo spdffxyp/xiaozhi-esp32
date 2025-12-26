@@ -1,0 +1,11 @@
+{
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "spdff-esp32-s3-board",
+            "sdkconfig_append": [
+                "CONFIG_LCD_ST7789_240X280=y"
+            ]
+        }
+    ]
+}
