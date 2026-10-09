@@ -1,0 +1,16 @@
+# Normalize line endings: store LF in the repository.
+* text=auto eol=lf
+
+# Windows scripts keep CRLF for PowerShell/CMD compatibility.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary files: never touched by text conversion.
+*.bin   binary
+*.a     binary
+*.mp3   binary
+*.wav   binary
+*.png   binary
+*.jpg   binary
+*.pdf   binary

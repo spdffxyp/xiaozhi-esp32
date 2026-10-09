@@ -1,0 +1,37 @@
+# Short clips (<3.0 s) in flashTone, sorted by duration - listen to WAVs first
+# 'TTS-shaped' = 16000 Hz mono (vendor prompt format)
+
+28    0.720s     17380 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\028.mp3
+29    0.840s     20260 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\029.mp3
+68    1.019s     45064 B   44100 Hz ch=1  <workspace>\ref\analysis\flashtone\068.mp3
+32    1.188s      9504 B   16000 Hz ch=1  <workspace>\ref\analysis\flashtone\032.mp3  <== TTS-SHAPED
+30    1.200s     28900 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\030.mp3
+31    1.272s     30628 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\031.mp3
+34    1.296s     10368 B   16000 Hz ch=1  <workspace>\ref\analysis\flashtone\034.mp3  <== TTS-SHAPED
+33    1.548s     12384 B   16000 Hz ch=1  <workspace>\ref\analysis\flashtone\033.mp3  <== TTS-SHAPED
+27    1.824s     43876 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\027.mp3
+25    2.208s     28312 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\025.mp3
+71    2.328s     66954 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\071.mp3
+61    2.403s      9872 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\061.mp3
+62    2.456s     10081 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\062.mp3
+63    2.508s     10290 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\063.mp3
+64    2.534s     10395 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\064.mp3
+65    2.556s     11629 B   16000 Hz ch=1  <workspace>\ref\analysis\flashtone\065.mp3  <== TTS-SHAPED
+21    2.560s     32085 B   22050 Hz ch=2  <workspace>\ref\analysis\flashtone\021.mp3
+22    2.586s     10603 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\022.mp3
+60    2.612s     10708 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\060.mp3
+56    2.612s     10708 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\056.mp3
+58    2.612s     10708 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\058.mp3
+59    2.612s     10708 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\059.mp3
+18    2.664s     33688 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\018.mp3
+67    2.691s     10989 B   22050 Hz ch=2  <workspace>\ref\analysis\flashtone\067.mp3
+57    2.717s     11126 B   22050 Hz ch=1  <workspace>\ref\analysis\flashtone\057.mp3
+51    2.769s     11335 B   22050 Hz ch=2  <workspace>\ref\analysis\flashtone\051.mp3
+26    2.784s     85878 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\026.mp3
+54    2.795s     11477 B   22050 Hz ch=2  <workspace>\ref\analysis\flashtone\054.mp3
+15    2.808s     36640 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\015.mp3
+48    2.873s     11721 B   22050 Hz ch=2  <workspace>\ref\analysis\flashtone\048.mp3
+13    2.976s     40336 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\013.mp3
+16    2.976s     41056 B   48000 Hz ch=2  <workspace>\ref\analysis\flashtone\016.mp3
+
+# WAV versions (16-bit PCM) are in <workspace>\ref\analysis\flashtone\wav\NNN.wav
