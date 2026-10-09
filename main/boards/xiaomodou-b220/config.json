@@ -1,0 +1,20 @@
+{
+    "type": "xiaomodou-b220",
+    "target": "esp32",
+    "builds": [
+        {
+            "name": "xiaomodou-b220",
+            "sdkconfig_append": [
+                "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/16m.csv\"",
+                "CONFIG_ESPTOOLPY_FLASHFREQ_80M=y",
+                "CONFIG_SPIRAM=y",
+                "CONFIG_SPIRAM_SPEED_80M=y",
+                "CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y",
+                "CONFIG_USE_ESP_WAKE_WORD=y",
+                "CONFIG_WAKE_WORD_DISABLED=n",
+                "CONFIG_USE_AFE_WAKE_WORD=n"
+            ]
+        }
+    ]
+}

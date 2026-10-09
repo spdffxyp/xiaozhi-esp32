@@ -164,6 +164,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_BREAD_COMPACT_ESP32_LCD
         bool "Bread Compact ESP32 DevKit + LCD (面包板)"
         depends on IDF_TARGET_ESP32
+    config BOARD_TYPE_XIAOMODOU_B220
+        bool "XiaoMoDou B220 AI Robot (小魔豆 B220)"
+        depends on IDF_TARGET_ESP32
     config BOARD_TYPE_BREAD_COMPACT_ML307
         bool "Bread Compact ML307/EC801E 4G (面包板)"
         depends on IDF_TARGET_ESP32S3
