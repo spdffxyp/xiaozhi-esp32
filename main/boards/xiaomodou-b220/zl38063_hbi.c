@@ -57,6 +57,50 @@
 
 static spi_device_handle_t s_hbi_dev = NULL;
 
+/*
+ * ONE HBI COMMAND AT A TIME - and this is not an optimisation, it is a
+ * correctness requirement.
+ *
+ * An HBI command is not atomic at the SPI level: reaching a register outside
+ * page 0 is TWO transactions (SELECT_PAGE, then the paged read/write), and even a
+ * page-0 register is a command transaction plus one transaction per data word.
+ * Two tasks interleaving those pieces corrupt the protocol: the second task's
+ * SELECT_PAGE lands between the first task's page select and its payload, so the
+ * first task's data goes to the wrong page.
+ *
+ * On hardware this showed up as an abort in the SPI driver
+ * (`assert failed: spi_device_transmit spi_master.c:1297 (ret_trans ==
+ * trans_desc)`) followed by a reboot, triggered as soon as the key poller and the
+ * codec's volume write were using the link from different tasks.  Before the
+ * volume work existed, the boot task was the only HBI user, so no lock was needed
+ * and none was there.
+ *
+ * A RECURSIVE mutex, because the composite operations (hbi_send_cmd() ->
+ * zl38063_hbi_wr16_cmd()) take it more than once from the same task.  It is
+ * created lazily, so the boot path may reach it before a mutex can be created.
+ */
+static SemaphoreHandle_t s_hbi_lock = NULL;
+
+static bool hbi_lock_take(void)
+{
+    if (s_hbi_lock == NULL) {
+        s_hbi_lock = xSemaphoreCreateRecursiveMutex();
+        if (s_hbi_lock == NULL) {
+            ESP_LOGE(TAG, "could not create the HBI mutex; HBI access is NOT serialised");
+            return false;
+        }
+    }
+    /* Short timeout: a stuck holder must not wedge the caller forever. */
+    return xSemaphoreTakeRecursive(s_hbi_lock, pdMS_TO_TICKS(500)) == pdTRUE;
+}
+
+static void hbi_lock_give(void)
+{
+    if (s_hbi_lock != NULL) {
+        (void)xSemaphoreGiveRecursive(s_hbi_lock);
+    }
+}
+
 /* Runtime byte-order switch: true = swap every 16-bit word (big-endian on the
  * wire, the upstream behaviour and the default). */
 static bool s_swap = (ZL38063_HBI_BIG_ENDIAN != 0);
@@ -113,9 +157,15 @@ static esp_err_t hbi_transmit_word(const uint16_t *tx, uint16_t *rx)
 
 void zl38063_hbi_set_swap(bool enable)
 {
+    /* Only ever changed by the diagnostics, but the byte order is process-wide
+     * state: flip it under the same lock that serialises the transactions. */
+    const bool locked = hbi_lock_take();
     s_swap = enable;
     ESP_LOGI(TAG, "word byte-order swap %s", enable ? "ENABLED (big-endian on "
              "the wire, default)" : "DISABLED (raw little-endian wire order)");
+    if (locked) {
+        hbi_lock_give();
+    }
 }
 
 bool zl38063_hbi_get_swap(void)
@@ -132,10 +182,12 @@ int zl38063_hbi_wr16_cmd(uint16_t cmd)
     if (s_hbi_dev == NULL) {
         return -1;
     }
-    if (hbi_transmit_word(&cmd, NULL) != ESP_OK) {
+    if (!hbi_lock_take()) {
         return -1;
     }
-    return 0;
+    const int rc = (hbi_transmit_word(&cmd, NULL) == ESP_OK) ? 0 : -1;
+    hbi_lock_give();
+    return rc;
 }
 
 int zl38063_hbi_wr16_data(uint16_t data)
@@ -143,10 +195,12 @@ int zl38063_hbi_wr16_data(uint16_t data)
     if (s_hbi_dev == NULL) {
         return -1;
     }
-    if (hbi_transmit_word(&data, NULL) != ESP_OK) {
+    if (!hbi_lock_take()) {
         return -1;
     }
-    return 0;
+    const int rc = (hbi_transmit_word(&data, NULL) == ESP_OK) ? 0 : -1;
+    hbi_lock_give();
+    return rc;
 }
 
 int zl38063_hbi_rd16(uint16_t *data)
@@ -154,10 +208,12 @@ int zl38063_hbi_rd16(uint16_t *data)
     if ((s_hbi_dev == NULL) || (data == NULL)) {
         return -1;
     }
-    if (hbi_transmit_word(NULL, data) != ESP_OK) {
+    if (!hbi_lock_take()) {
         return -1;
     }
-    return 0;
+    const int rc = (hbi_transmit_word(NULL, data) == ESP_OK) ? 0 : -1;
+    hbi_lock_give();
+    return rc;
 }
 
 /*----------------------------------------------------------------------------
@@ -329,15 +385,23 @@ int zl38063_hbi_write(uint16_t cmd, uint8_t numwords, const uint16_t *data)
     if (s_hbi_dev == NULL) {
         return -1;
     }
+    if (!hbi_lock_take()) {
+        return -1;
+    }
 
+    /* SELECT_PAGE + command + every data word: one indivisible unit, or another
+     * task's page select lands in the middle of it. */
     if (hbi_send_cmd(cmd, numwords, 1) != 0) {
+        hbi_lock_give();
         return -1;
     }
     for (uint8_t i = 0; i < numwords; i++) {
         if (zl38063_hbi_wr16_data(data[i]) != 0) {
+            hbi_lock_give();
             return -1;
         }
     }
+    hbi_lock_give();
     return 0;
 }
 
@@ -349,14 +413,22 @@ int zl38063_hbi_read(uint16_t cmd, uint8_t numwords, uint16_t *data)
     if (s_hbi_dev == NULL) {
         return -1;
     }
+    if (!hbi_lock_take()) {
+        return -1;
+    }
 
+    /* SELECT_PAGE + command + every data word, indivisible - see the note on
+     * s_hbi_lock above. */
     if (hbi_send_cmd(cmd, numwords, 0) != 0) {
+        hbi_lock_give();
         return -1;
     }
     for (uint8_t i = 0; i < numwords; i++) {
         if (zl38063_hbi_rd16(&data[i]) != 0) {
+            hbi_lock_give();
             return -1;
         }
     }
+    hbi_lock_give();
     return 0;
 }

@@ -1,6 +1,13 @@
 #include "zl38063_audio_codec.h"
 
 #include "b220_audio_share.h"
+/*
+ * zl38063_dsp_set_volume(): the REAL output-level control, which writes the
+ * gain byte into HBI 0x0238/0x023A exactly as the stock firmware's own volume
+ * routine does (PART 2 §6.3).  Declared here rather than pulled in wholesale so
+ * this codec keeps depending on one function, not on the whole DSP module.
+ */
+#include "zl38063_dsp.h"
 
 #include <esp_err.h>
 #include <esp_log.h>
@@ -138,20 +145,41 @@ void Zl38063AudioCodec::Start() {
              input_sample_rate_, (int)(8 * sizeof(int16_t)), B220_CODEC_I2S_SLOTS);
 }
 
+/*
+ * REAL volume: the value is stored by the base class (Settings/"audio"/
+ * output_volume, so it survives a reboot and shows up in the UI and in the MCP
+ * status blob) AND pushed into the DSP, whose output gain is what actually
+ * decides how loud the speaker is.
+ *
+ * Where the gain lives (PART 2 §6.3): the stock firmware's own play path calls
+ * VprocTwolfSetVolume(tblA[vol/10]), which writes the same gain byte into both
+ * halves of HBI 0x0238 and HBI 0x023A.  zl38063_dsp_set_volume() is this port's
+ * implementation of exactly that, with the encoding vol 0 -> -90 dB and vol 100
+ * -> +10 dB (the DSP saturates at +6 dB).  The config record loaded at boot
+ * leaves those registers at the volume-70 equivalent, so this call is a real
+ * change rather than a no-op.
+ *
+ * The earlier revision of this method deliberately did nothing here, on the
+ * grounds that the level was "written by the boot config record".  That is true
+ * only until the first user volume change: the register is writable at run time,
+ * and writing it is what the stock firmware itself does when its volume changes.
+ *
+ * Failure is not fatal: when the DSP is not ready (or the HBI write fails) the
+ * value is still stored, and the log says that the audio level did not follow.
+ */
 void Zl38063AudioCodec::SetOutputVolume(int volume) {
-    /* Stored and persisted by the base class (Settings/"audio"/output_volume), so
-     * the value survives a reboot and is visible in the UI - but it is NOT
-     * applied to the audio path: the ZL38063's own output level lives in the DSP
-     * (regs 0x238/0x23A, -90 dB + vol) and is written by the 1042-entry config
-     * record / zl38063_dsp_set_volume() at boot, not by anything this codec can
-     * reach over I2S.  A software volume here would additionally mean scaling
-     * every playback sample on the ESP32, which the proven path does not do. */
     AudioCodec::SetOutputVolume(volume);
-    ESP_LOGW(TAG,
-             "SetOutputVolume(%d): stored, but NOT applied by this codec - the "
-             "ZL38063 output volume is set in the DSP (regs 0x238/0x23A) by the "
-             "config record loaded during the board's boot bring-up",
-             volume);
+
+    const esp_err_t err = zl38063_dsp_set_volume((uint8_t)volume);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "SetOutputVolume(%d): stored AND applied to the DSP "
+                      "(HBI 0x0238/0x023A, gain = vol - 90 dB)",
+                 volume);
+    } else {
+        ESP_LOGW(TAG, "SetOutputVolume(%d): stored, but the DSP write failed (%s) - the "
+                      "speaker level did not change",
+                 volume, esp_err_to_name(err));
+    }
 }
 
 void Zl38063AudioCodec::EnableInput(bool enable) {

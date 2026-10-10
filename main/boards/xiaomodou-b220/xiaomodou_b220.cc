@@ -10,6 +10,13 @@
 #include "application.h"
 #include "button.h"
 #include "b220_baseboard_probe.h"
+#if B220_BUTTON_DISCOVERY
+#include "b220_button_discovery.h"
+#else
+#include "b220_buttons.h"
+#endif
+#include "b220_led.h"
+#include "b220_base_uart.h"
 /*
  * config.h must come BEFORE zl38063_dsp.h: zl38063_dsp.h exposes the
  * B220_DSP_* guarded declarations only if the macro is already defined when it
@@ -830,6 +837,12 @@ static esp_err_t B220_I2sUpBeforeDspBoot() {
  * definition in always is what keeps every switch combination linking).
  * ------------------------------------------------------------------------- */
 static i2c_master_dev_handle_t s_board_aw9106_dev = nullptr;
+/* File-scope mirror of the I2C0 master bus handle, filled in by
+ * InitializeBacklight() the moment the bus exists.  Read by the two accessors at
+ * the bottom of this file: b220_led_i2c_bus() (always) and
+ * b220_button_discovery_i2c_bus() (discovery builds only).  Borrowers only ever
+ * ADD devices to this bus - none of them creates or frees it. */
+static i2c_master_bus_handle_t s_board_i2c_bus = nullptr;
 
 /* ---------------------------------------------------------------------------
  * The audit state.
@@ -2771,6 +2784,7 @@ static unsigned s_b220_autolisten_wait_ticks = 0;/* polls left before the arm   
  * (start the power timer, then EnableOutput(true)); on this codec that is a
  * latched no-op for the AW8737S PA, so it can never add a SHDN edge.
  */
+
 static void B220_AutoListenEnsureAudioPath() {
     AudioCodec* codec = Board::GetInstance().GetAudioCodec();
     if ((codec == nullptr) || codec->output_enabled() || s_b220_autolisten_path_fixed ||
@@ -2922,6 +2936,190 @@ static void B220_AutoListenStart() {
 }
 
 #endif  /* B220_AUTO_LISTEN */
+
+#if !B220_BUTTON_DISCOVERY
+/*
+ * The three physical keys, which are read THROUGH THE ZL38063 (see
+ * b220_buttons.h and BUTTON-HARDWARE-REVERSE.md): the stock firmware's buttonTask
+ * polls HBI 0x0000 (code) and HBI 0x0002 (status) over the same SPI link this
+ * port uses for the DSP, and a press is a short pulse on both.
+ *
+ * The handler runs on the poller's task, never on the main event loop, so it
+ * only calls Application's event-based thread-safe entry points
+ * (application.h:93-109: ToggleChatState / StartListening / StopListening) and
+ * the codec's volume setter.
+ *
+ * There is no long-press branch: this hardware cannot report how long a key was
+ * held (b220_buttons.h), so every press is one action.
+ *
+ * The volume keys are honest about a hardware limit: Zl38063AudioCodec::
+ * SetOutputVolume() stores the value (NVS + the UI's volume indicator) but does
+ * NOT change the output level, because the real gain lives inside the DSP
+ * (registers 0x0238/0x023A) and this port has no verified run-time write for it
+ * (PART 3 §1.6).  So the keys work as far as the firmware can take them, and the
+ * log says so instead of pretending.
+ */
+/*
+ * ---------------------------------------------------------------------------
+ * Volume keys: SINGLE press = one step, DOUBLE press = jump to the end of the
+ * range.
+ *
+ * Why double press and not long press: this front-end cannot report how long a
+ * key was held (b220_buttons.h).  A double press, on the other hand, is pure
+ * sequencing, which the interface does report reliably - one 0x0003 per press,
+ * and no second event while a key is held (measured).
+ *
+ * The step is therefore DEFERRED by B220_BUTTON_DOUBLE_CLICK_MS: if a second
+ * press of the SAME key arrives inside that window the jump replaces the step,
+ * otherwise the step is applied when the window closes.  The cost is that a
+ * single volume step lands B220_BUTTON_DOUBLE_CLICK_MS after the press; the
+ * benefit is that a double press never first moves by one step and then jumps.
+ * The record key is NOT deferred - it opens/closes a conversation immediately.
+ * ---------------------------------------------------------------------------
+ */
+static void B220_ButtonSetVolume(bool up, bool jump) {
+    auto* codec = static_cast<Zl38063AudioCodec*>(Board::GetInstance().GetAudioCodec());
+    if (codec == nullptr) {
+        ESP_LOGW(TAG, "key %s: no codec to set", up ? "VOLUME_UP" : "VOLUME_DOWN");
+        return;
+    }
+
+    const int before = codec->output_volume();
+    int volume;
+    if (jump) {
+        volume = up ? B220_BUTTON_VOLUME_MAX : B220_BUTTON_VOLUME_MIN;
+    } else {
+        volume = before + (up ? B220_BUTTON_VOLUME_STEP : -B220_BUTTON_VOLUME_STEP);
+    }
+    if (volume < B220_BUTTON_VOLUME_MIN) {
+        volume = B220_BUTTON_VOLUME_MIN;
+    }
+    if (volume > B220_BUTTON_VOLUME_MAX) {
+        volume = B220_BUTTON_VOLUME_MAX;
+    }
+
+    /* This stores the value AND writes the DSP's real output gain; see
+     * Zl38063AudioCodec::SetOutputVolume(). */
+    codec->SetOutputVolume(volume);
+    ESP_LOGI(TAG, "key %s (%s): volume %d -> %d",
+             up ? "VOLUME_UP" : "VOLUME_DOWN", jump ? "double press" : "single press",
+             before, volume);
+}
+
+/* The deferred single-press step, and the state that decides whether a second
+ * press upgrades it to a jump. */
+static esp_timer_handle_t s_b220_volume_timer = nullptr;
+static bool s_b220_pending_valid = false;      /* a step is waiting on the timer */
+static bool s_b220_pending_up = false;
+
+static void B220_VolumeTimerCb(void* arg) {
+    (void)arg;
+    if (!s_b220_pending_valid) {
+        return;
+    }
+    s_b220_pending_valid = false;
+    B220_ButtonSetVolume(s_b220_pending_up, /*jump=*/false);
+}
+
+static void B220_ButtonAction(b220_button_action_t action) {
+    Application& app = Application::GetInstance();
+
+    /*
+     * Acknowledge every accepted key action on the board's indicator lights.
+     * Non-blocking: b220_led.c services the effect on its own task.  This is the
+     * only feedback the toy can give without the screen.
+     */
+    (void)b220_led_blink_once();
+
+    switch (action) {
+    case B220_BTN_ACTION_RECORD:
+        /* The record/talk key: the same entry point a wake word uses.  Acted on
+         * immediately - deferring a conversation toggle would feel broken. */
+        app.ToggleChatState();
+        ESP_LOGI(TAG, "key RECORD: ToggleChatState() requested (state %s)",
+                 DeviceStateMachine::GetStateName(app.GetDeviceState()));
+        break;
+
+    case B220_BTN_ACTION_VOLUME_UP:
+    case B220_BTN_ACTION_VOLUME_DOWN: {
+        const bool up = (action == B220_BTN_ACTION_VOLUME_UP);
+
+        if (s_b220_pending_valid && s_b220_pending_up == up) {
+            /* Second press of the SAME key inside the window: this is a double
+             * press, so cancel the waiting step and jump instead. */
+            s_b220_pending_valid = false;
+            if (s_b220_volume_timer != nullptr) {
+                (void)esp_timer_stop(s_b220_volume_timer);
+            }
+            ESP_LOGI(TAG, "key %s: double press detected", up ? "VOLUME_UP" : "VOLUME_DOWN");
+            B220_ButtonSetVolume(up, /*jump=*/true);
+            break;
+        }
+
+        /* First press (or a press of the OTHER volume key): arm a step, to be
+         * applied only if no second press of the same key follows. */
+        if (s_b220_pending_valid && s_b220_volume_timer != nullptr) {
+            /* A different key arrived: flush the pending step now so both actions
+             * are honoured in order. */
+            (void)esp_timer_stop(s_b220_volume_timer);
+            s_b220_pending_valid = false;
+            B220_ButtonSetVolume(s_b220_pending_up, /*jump=*/false);
+        }
+        s_b220_pending_valid = true;
+        s_b220_pending_up = up;
+        if (s_b220_volume_timer != nullptr) {
+            (void)esp_timer_stop(s_b220_volume_timer);
+            (void)esp_timer_start_once(s_b220_volume_timer,
+                                       (uint64_t)B220_BUTTON_DOUBLE_CLICK_MS * 1000);
+        } else {
+            /* No timer (creation failed): fall back to acting immediately, so the
+             * key still works - it just loses the double-press upgrade. */
+            s_b220_pending_valid = false;
+            B220_ButtonSetVolume(up, /*jump=*/false);
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+static void B220_ButtonsStart() {
+    /*
+     * The one-shot that applies a single volume step B220_BUTTON_DOUBLE_CLICK_MS
+     * after the press unless a second press cancels it.  Created here (once per
+     * boot) rather than lazily, so the key handler never has to allocate.
+     */
+    if (s_b220_volume_timer == nullptr) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = B220_VolumeTimerCb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,   /* runs in the timer task: safe to call the codec */
+            .name = "b220_volume",
+            .skip_unhandled_events = true,
+        };
+        const esp_err_t terr = esp_timer_create(&timer_args, &s_b220_volume_timer);
+        if (terr != ESP_OK) {
+            s_b220_volume_timer = nullptr;
+            ESP_LOGW(TAG, "volume: esp_timer_create failed (%s); the volume keys will act "
+                          "immediately and lose the double-press jump",
+                     esp_err_to_name(terr));
+        }
+    }
+
+    const esp_err_t err = b220_buttons_start(B220_ButtonAction);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "the ZL38063 key poller did not start (%s); the three physical keys "
+                      "will do nothing", esp_err_to_name(err));
+    }
+#if !B220_BUTTON_KEY_1 || !B220_BUTTON_KEY_2 || !B220_BUTTON_KEY_3
+    ESP_LOGW(TAG, "the key->function mapping is NOT configured "
+                  "(B220_BUTTON_KEY_1/2/3 = 0 in config.h): each press is logged with its raw "
+                  "key value but no action is taken - see docs/BUTTON-DISCOVERY.md.");
+#endif
+}
+#endif  /* !B220_BUTTON_DISCOVERY */
 
 /*
  * Factory ILI9341 initialisation table, extracted from the stock firmware image
@@ -3102,6 +3300,11 @@ private:
             ESP_LOGE(TAG, "AW9106B: i2c bus init failed (%s); backlight stays off", esp_err_to_name(err));
             return;
         }
+        /* Publish the bus for b220_led_i2c_bus() and
+         * b220_button_discovery_i2c_bus().  Done here, and not after the AW9106B
+         * device is registered, so the borrowers can see the bus even if the LED
+         * driver itself does not answer. */
+        s_board_i2c_bus = i2c_bus_;
 
         i2c_device_config_t dev_cfg = {};
         dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
@@ -3212,13 +3415,34 @@ private:
 
 #if B220_ORIENT_CARD
     /*
-     * One-shot bring-up aid: 8 vertical colour bars (R G B White blacK Yellow
-     * Cyan Magenta from the left edge) plus white 12x12 blocks in the top-left
-     * and bottom-right corners.  A human can then report orientation,
-     * mirroring, offsets and colour order in a single pass.
+     * One-shot bring-up aid: 8 colour bars (R G B White blacK Yellow Cyan
+     * Magenta) plus white 12x12 blocks in the top-left and bottom-right corners.
+     * A human can then report orientation, mirroring, offsets and colour order
+     * in a single pass.
+     *
+     * The card is drawn with a RAW esp_lcd_panel_draw_bitmap(), i.e. in PANEL
+     * coordinates, so it uses the glass size (B220_DISPLAY_PANEL_*) and not the
+     * LVGL logical size.  With B220_DISPLAY_ROTATE_90 = 1 the panel has
+     * swap_xy set, so what appears on screen is this card rotated by 90 deg:
+     * the 8 bars come out as horizontal bands from one edge, and "left" in the
+     * buffer is "top" on the glass.  Read it like that:
+     *
+     *   portrait  (rotate90 = 0): bars are VERTICAL stripes from the left edge,
+     *                             white corners at top-left + bottom-right;
+     *   landscape (rotate90 = 1): bars are HORIZONTAL bands from the top edge,
+     *                             white corners at top-right + bottom-left
+     *                             (or top-left + bottom-right if the rotation
+     *                             went the other way).
+     *
+     * Either way, exactly ONE white corner must be in the top row and one in the
+     * bottom row, and the bar order must read R G B W K Y C M.  If the corners
+     * are in the same column there is no rotation; if the colours read
+     * R B G ... the byte order is wrong (a raw write must hand the panel the
+     * high byte first, hence the __builtin_bswap16() below - the LVGL path does
+     * this itself via swap_bytes).
      */
     void DrawOrientationCard(esp_lcd_panel_handle_t panel) {
-        const int w = DISPLAY_WIDTH, h = DISPLAY_HEIGHT;
+        const int w = B220_DISPLAY_PANEL_WIDTH, h = B220_DISPLAY_PANEL_HEIGHT;
         auto* fb = (uint16_t*)heap_caps_malloc(w * h * sizeof(uint16_t), MALLOC_CAP_DMA);
         if (!fb) {
             ESP_LOGW(TAG, "orientation card: no DMA-capable memory");
@@ -3227,8 +3451,6 @@ private:
         const uint16_t bars[8] = {0xF800, 0x07E0, 0x001F, 0xFFFF,
                                   0x0000, 0xFFE0, 0x07FF, 0xF81F};
         for (int x = 0; x < w; ++x) {
-            // A raw panel write must hand the panel the high byte first, so
-            // byte-swap here (the LVGL path does this itself via swap_bytes).
             const uint16_t c = __builtin_bswap16(bars[(x * 8) / w]);
             for (int y = 0; y < h; ++y) {
                 fb[y * w + x] = c;
@@ -3240,7 +3462,9 @@ private:
                 fb[(h - 1 - y) * w + (w - 1 - x)] = 0xFFFF;  // bottom-right marker
             }
         }
-        ESP_LOGW(TAG, "ORIENT CARD %dx%d: bars R G B W K Y C M from the left, white corners TL+BR", w, h);
+        ESP_LOGW(TAG, "ORIENT CARD panel %dx%d (LVGL logical %dx%d, rotate90=%d): bars R G B W K Y C M "
+                      "in panel order, white corners at panel TL+BR",
+                 w, h, DISPLAY_WIDTH, DISPLAY_HEIGHT, (int)B220_DISPLAY_ROTATE_90);
         ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, w, h, fb));
         free(fb);
     }
@@ -3294,8 +3518,32 @@ private:
 #endif
         // No esp_lcd_panel_invert_color() / disp_on_off() here on purpose:
         // the factory table already sends 0x21 and 0x29.
+        //
+        // The 90 deg rotation (B220_DISPLAY_ROTATE_90 in config.h) is applied
+        // HERE, as a real MADCTL write, and not through lv_display_set_rotation():
+        // this port never calls set_rotation(), so lvgl_port_disp.c's
+        // lvgl_port_disp_rotation_update() stays at LV_DISPLAY_ROTATION_0 and
+        // re-asserts exactly the transform we pass to SpiLcdDisplay() below.
+        // The two arguments are the same DISPLAY_SWAP_XY / DISPLAY_MIRROR_*
+        // macros, so the panel and the LVGL resolution can never disagree.
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY));
+        /* A 90 deg rotation is "logical X runs along the panel's Y".  The numbers
+         * to check at the bench are these three: the glass is physically
+         * 128 x 160 (B220_DISPLAY_PANEL_*), the LVGL screen must be the other way
+         * round, and the panel must have been told exactly the transform we then
+         * hand to SpiLcdDisplay().  If the picture comes out rotated the wrong
+         * way, flip DISPLAY_MIRROR_X together with DISPLAY_MIRROR_Y in config.h
+         * (that reverses the direction of the rotation and nothing else). */
+        ESP_LOGI(TAG, "LCD geometry: glass %dx%d -> LVGL logical %dx%d "
+                      "(swap_xy=%d mirror_x=%d mirror_y=%d, rotate90=%d, MADCTL written per driver cache)",
+                 B220_DISPLAY_PANEL_WIDTH, B220_DISPLAY_PANEL_HEIGHT,
+                 DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                 (int)DISPLAY_SWAP_XY, (int)DISPLAY_MIRROR_X, (int)DISPLAY_MIRROR_Y,
+                 (int)B220_DISPLAY_ROTATE_90);
+#if !B220_DISPLAY_LOGICAL_IS_VALID()
+#error "DISPLAY_WIDTH/HEIGHT do not match the panel size for the selected rotation (see config.h)"
+#endif
 
 #if B220_ORIENT_CARD
         DrawOrientationCard(panel);
@@ -3709,9 +3957,23 @@ private:
 #endif
 
     void InitializeButtons() {
-        // No button is wired to the ESP32 on this board (see config.h); the
-        // 启动键 is a baseboard power latch and GPIO0 is the boot strap /
-        // ZL38063 chip-select.  WiFi provisioning happens automatically.
+        /*
+         * The board DOES have three keys (record / volume+ / volume-), but none
+         * of them is wired to an ESP32 GPIO, so nothing can be registered here:
+         * the stock firmware reads them from two ZL38063 HBI registers over the
+         * same SPI link this port uses for the DSP (reg 0x0002 = status,
+         * reg 0x0000 = key code), which is confirmed on hardware.
+         *
+         * The keys are therefore driven by b220_buttons.c, started at the END of
+         * the constructor - i.e. after the DSP host-boot - because that poller
+         * cannot work until the HBI link exists.  Starting it here would just
+         * spend the whole bring-up logging read failures.
+         *
+         * What is genuinely absent on this board: a power key the ESP32 can read
+         * (it is a baseboard soft latch) and GPIO0 as a BOOT button (it is the
+         * boot strapping pin and the ZL38063 chip select).  WiFi provisioning
+         * therefore happens automatically when no credentials are stored.
+         */
     }
 
 public:
@@ -3779,6 +4041,68 @@ public:
          * stub only logs why nothing will start a conversation).
          */
         B220_AutoListenStart();
+#if B220_BUTTON_DISCOVERY
+        /* Find out which chip actually samples the toy's three keys.  The task
+         * only READS (see b220_button_discovery.h); it is started last so the
+         * audio bring-up, the PA enable and the panel are already in their final
+         * state and the probe cannot be blamed for changing any of them. */
+        {
+            const esp_err_t btn_err = b220_button_discovery_start();
+            if (btn_err != ESP_OK) {
+                ESP_LOGW(TAG, "button discovery: could not start (%s)", esp_err_to_name(btn_err));
+            }
+        }
+#endif
+#if !B220_BUTTON_DISCOVERY
+        ESP_LOGI(TAG, "board init: starting the ZL38063 key poller");
+        /* The three physical keys, polled through the ZL38063 over HBI.  Started
+         * last so the DSP host-boot, the PA enable and the panel are already in
+         * their final state - the poller only reads two DSP registers, but this
+         * order keeps "who touched what" unambiguous in the log. */
+        B220_ButtonsStart();
+        ESP_LOGI(TAG, "board init: key poller started (task created)");
+#endif
+        /*
+         * Board indicator lights (AW9106B 0x23/0x24) - see b220_led.h.  This runs
+         * AFTER the PA enable on purpose: it attaches its own device to the same
+         * I2C bus and only ever writes 0x20..0x25, never the SHDN register 0x02,
+         * so the amplifier's single rising edge is untouched.
+         */
+        ESP_LOGI(TAG, "board init: starting the indicator-light module");
+        {
+            const esp_err_t led_err = b220_led_start();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "indicator lights: b220_led_start() -> %s",
+                         esp_err_to_name(led_err));
+            }
+        }
+        ESP_LOGI(TAG, "board init: indicator-light module returned");
+        /* One acknowledgement blink so the indicator path is visibly alive. */
+        b220_led_blink_once();
+        ESP_LOGI(TAG, "board init: acknowledgement blink requested");
+        /*
+         * Baseboard link (motors, head/tail lights) on UART0 - the same wire as
+         * the console.  Only the "AT+Pon" handshake is sent automatically; motion
+         * frames are sent on demand through b220_base_uart.h.
+         */
+        ESP_LOGI(TAG, "board init: starting the baseboard handshake");
+        {
+            const esp_err_t base_err = b220_base_uart_start_handshake();
+            if (base_err != ESP_OK) {
+                ESP_LOGW(TAG, "baseboard: handshake could not start (%s)",
+                         esp_err_to_name(base_err));
+            }
+        }
+
+        /*
+         * Board constructor finished.  This line exists because a boot that
+         * stalled inside the constructor (the key poller busy-looping on the
+         * GPIO38 edge flag) looked exactly like "the DSP is slow to come up" in
+         * the log: everything after this point simply never ran.  With this
+         * marker, a stall is obvious and its location is between two lines.
+         */
+        ESP_LOGI(TAG, "board init complete: display, keys, indicator lights and the baseboard "
+                      "link are up (application start follows)");
 #if B220_BACKLIGHT_SWEEP
         /* BRING-UP PROBE ONLY.  This pair runs LAST in the constructor, i.e. AFTER
          * the PA enable sequence, and ProbeAw9106() still issues a 0x7F software
@@ -3847,5 +4171,32 @@ extern "C" __attribute__((weak)) esp_err_t b220_aw9106_set_gpio_output_a(uint8_t
     }
     return b220_aw9106_write_reg02(dev, value, "b220_aw9106_set_gpio_output_a()");
 }
+
+/* b220_led.c borrows the board's I2C0 bus to attach its own READ/WRITE device
+ * for the AW9106B (indicator channels 0x23/0x24).  It writes nothing else on that
+ * chip - in particular never register 0x02, which the AW8737S SHDN line owns.
+ * Compiled unconditionally: the indicator lights exist in every build. */
+extern "C" i2c_master_bus_handle_t b220_led_i2c_bus(void);
+extern "C" i2c_master_bus_handle_t b220_led_i2c_bus(void) {
+    return s_board_i2c_bus;
+}
+
+#if B220_BUTTON_DISCOVERY
+/* b220_button_discovery.c borrows the board's I2C0 bus to attach its own
+ * READ-ONLY devices (the AW9106B at 0x5B for its GPIO input registers, and the
+ * SC7A20 at 0x19 for its CLICK/INT1 registers).  It must not own that bus:
+ * InitializeBacklight() created it and the AW8737S SHDN write path lives on it.
+ *
+ * All this hands out is the handle, from the file-scope mirror that
+ * InitializeBacklight() fills in as soon as i2c_new_master_bus() succeeds - so
+ * the hand-out is valid from the moment the bus exists and it stays NULL (and
+ * the probe skips the I2C sources) when the backlight bring-up failed.  It is
+ * compiled out together with the rest of the probe when B220_BUTTON_DISCOVERY
+ * is 0, which is the production value. */
+extern "C" i2c_master_bus_handle_t b220_button_discovery_i2c_bus(void);
+extern "C" i2c_master_bus_handle_t b220_button_discovery_i2c_bus(void) {
+    return s_board_i2c_bus;
+}
+#endif
 
 DECLARE_BOARD(XiaoMoDouB220Board);

@@ -55,17 +55,68 @@
 #define DISPLAY_DC_PIN       GPIO_NUM_21
 #define DISPLAY_RST_PIN      GPIO_NUM_22
 
-#define DISPLAY_WIDTH   128
-#define DISPLAY_HEIGHT  160
+/* --- geometry -------------------------------------------------------------
+ * The GLASS is 128 x 160 (measured on hardware, see the panel notes above).
+ * DISPLAY_WIDTH / DISPLAY_HEIGHT are the LVGL *logical* screen: what Layout()
+ * and LV_HOR_RES / LV_VER_RES see.  Everything the panel driver is told is
+ * derived from these two plus DISPLAY_SWAP_XY / DISPLAY_MIRROR_*, so the
+ * logical size and the transform can never drift apart.
+ *
+ *   DISPLAY_SWAP_XY == false -> logical 128 x 160 (portrait, the stock idea)
+ *   DISPLAY_SWAP_XY == true  -> logical 160 x 128 (landscape, rotated 90 deg)
+ *
+ * B220_DISPLAY_ROTATE_90 is the knob that flips DISPLAY_SWAP_XY and recomputes
+ * the logical size, because a 90 deg rotation is exactly "swap X and Y".
+ * DISPLAY_MIRROR_X / _Y are then swapped with it so that the *relative*
+ * handedness of the picture is unchanged - the result is a pure rotation and
+ * not a rotation plus a mirror.
+ */
+#define B220_DISPLAY_ROTATE_90 1
+
+#define B220_DISPLAY_PANEL_WIDTH   128
+#define B220_DISPLAY_PANEL_HEIGHT  160
+
+#if B220_DISPLAY_ROTATE_90
+/* 90 deg: X and Y change places, so the logical canvas is 160 x 128.  This is
+ * the meaningful rotation for this toy: the glass sits in a wide, short window,
+ * so portrait artwork is cramped while landscape fits the "eyes" UI.
+ *
+ * The transform handed to the panel driver is a real MADCTL write, and the
+ * flush path then draws straight into panel coordinates.  lvgl_port_disp.c
+ * (_lvgl_port_transform / lvgl_port_disp_rotation_update) is what normally
+ * applies this at LV_DISPLAY_ROTATION_0, so this switch is the conventional
+ * way to rotate: the port is left at ROTATION_0 and the panel does the work. */
+#define DISPLAY_WIDTH   B220_DISPLAY_PANEL_HEIGHT   /* 160 */
+#define DISPLAY_HEIGHT  B220_DISPLAY_PANEL_WIDTH    /* 128 */
+#define DISPLAY_SWAP_XY  true
+#define DISPLAY_MIRROR_X false
+#define DISPLAY_MIRROR_Y true
+#else
+#define DISPLAY_WIDTH   B220_DISPLAY_PANEL_WIDTH    /* 128 */
+#define DISPLAY_HEIGHT  B220_DISPLAY_PANEL_HEIGHT   /* 160 */
+#define DISPLAY_SWAP_XY  false
 #define DISPLAY_MIRROR_X false
 #define DISPLAY_MIRROR_Y false
-#define DISPLAY_SWAP_XY  false
+#endif
+
 /* The factory init table issues 0x21 (INVON) itself and sets MADCTL (0x36)=0x00
- * (RGB order, no mirror/swap), so the panel driver must not invert or re-map. */
+ * (RGB order, no mirror/swap), so the panel driver must not invert or re-map
+ * the colour order.  Note the driver does NOT re-read MADCTL after the factory
+ * table: it caches the value written by its own init sequence, so the
+ * mirror/swap calls below compose correctly on top of the table's 0x00. */
 #define DISPLAY_RGB_ORDER LCD_RGB_ELEMENT_ORDER_RGB
 #define DISPLAY_OFFSET_X 0
 #define DISPLAY_OFFSET_Y 0
 #define DISPLAY_SPI_MODE 0
+
+/* Compile-time guard: the two numbers below must be the same canvas.  If they
+ * ever stop matching, the panel transform and the LVGL resolution describe
+ * different screens and the picture tears or wraps at the edges. */
+#define B220_DISPLAY_LOGICAL_IS_VALID()                                        \
+    ((DISPLAY_WIDTH == (B220_DISPLAY_ROTATE_90 ? B220_DISPLAY_PANEL_HEIGHT     \
+                                               : B220_DISPLAY_PANEL_WIDTH)) && \
+     (DISPLAY_HEIGHT == (B220_DISPLAY_ROTATE_90 ? B220_DISPLAY_PANEL_WIDTH    \
+                                                : B220_DISPLAY_PANEL_HEIGHT)))
 
 /* The stock LCD config struct carries no backlight pin: the panel backlight is
  * either tied on or driven from the baseboard.  Leave it uncontrolled for now. */
@@ -99,6 +150,164 @@
  * (the panel expects the high byte first) - that is why the card looked
  * colour-swapped while the LVGL UI does not. */
 #define B220_ORIENT_CARD      0
+
+/* ------------------------------------------------------- button discovery --
+ * B220_BUTTON_DISCOVERY turns the firmware into a probe for the toy's three
+ * physical keys (record / volume-up / volume-down).
+ *
+ * Why it is needed: nothing in the stock image or in the reversals so far says
+ * which chip samples those keys.  The stock button code takes its pins from a
+ * runtime configuration (so they are not immediates in the image), the stock
+ * ZL38063 configuration record leaves the whole DSP GPIO register block
+ * (0x0700..0x0A22) at zero, and the ESP32 pins this port already owns cover the
+ * LCD, I2S, HBI, I2C and the DSP reset - which leaves GPIO 20 / 36 / 39 as the
+ * only plausibly free ones.
+ *
+ * So rather than guess, the probe samples EVERY input source the board could
+ * use and logs the moment one changes:
+ *   - ESP32 GPIOs 20, 36, 39 (plus 0 only if B220_BUTTON_PROBE_GPIO0 = 1),
+ *     each read with the internal pull-up on and with every pull off;
+ *   - the AW9106B (I2C 0x5B) input-data registers 0x00/0x01 and its mode/output
+ *     registers;
+ *   - the ZL38063 over HBI: its whole register address space, pages
+ *     0..B220_BUTTON_DSP_PAGES-1;
+ *   - the SC7A20 accelerometer (I2C 0x19) CLICK/INT1 status registers.
+ *
+ * It ONLY reads: no DSP reg 0x0014, no reset, no page-255 window base, no
+ * AW9106B reg 0x02 (so the AW8737S keeps its one SHDN rising edge).  The task it
+ * starts is compiled out entirely when this is 0, which is the production value.
+ *
+ * Procedure: flash with it at 1, leave the unit alone ~30 s, then press and hold
+ * one key at a time; the `btn-disc: CHANGE` lines name the source. */
+#define B220_BUTTON_DISCOVERY   0
+/* Deepest HBI page swept.  Pages 0..3 are the documented register range; the
+ * config record lives in 0x02..0x0A.  0x40 pages x 128 words = 8192 addresses,
+ * which is the whole HBI space the 8-bit page field can address. */
+#define B220_BUTTON_DSP_PAGES   0x40
+/* Pages re-read on the fast tick; the rest of the space is swept on the slow
+ * tick and at boot.  4 pages = 512 reads per fast sweep. */
+#define B220_BUTTON_DSP_LIVE_PAGES 4
+#define B220_BUTTON_FAST_PERIOD_MS 300
+#define B220_BUTTON_DEEP_PERIOD_MS 30000
+#define B220_BUTTON_TOP_PERIOD_MS  30000
+/* The TWO ZL38063 registers the stock firmware's own buttonTask polls:
+ * HBI 0x0000 ("status") and HBI 0x0002 (the event/key code).  Reverse
+ * engineering of the stock image found that this - not an ESP32 GPIO and not the
+ * AW9106B - is where the stock gets its key input from (BUTTON-HARDWARE-REVERSE.md),
+ * and the stock polls it every 10 ms (gpioclear = 10 ticks, with a 50-tick
+ * debounce and a 2000-tick long press).  A key event can be a short pulse, so
+ * these two are also polled here, separately from the coarse whole-register
+ * sweep, at the stock cadence. */
+#define B220_BUTTON_BTN_PERIOD_MS  10
+/* Deep whole-address-space sweep (0..B220_BUTTON_DSP_PAGES-1).  The first
+ * hardware run showed it is not needed and actively harmful: the two registers
+ * that carry the keys are polled on their own at B220_BUTTON_BTN_PERIOD_MS, and
+ * the deep sweep's thousands of extra HBI word reads ring onto the input-only
+ * GPIOs and produce a wall of `CHANGE zl38063-hbi: reg 0x00DC ...` lines that
+ * are just the HBI command word being read back.  Set to 1 only to go looking
+ * for an unknown register again. */
+#define B220_BUTTON_DEEP_SWEEP     0
+/* GPIO0 is the ZL38063 HBI chip select AND the boot strapping pin.  Sampling it
+ * is very likely still fine (a read with a pull-up only ever helps it stay
+ * high), but a board that drives it low would produce a permanent "change", so
+ * it is opt-in and off by default. */
+#define B220_BUTTON_PROBE_GPIO0 0
+
+/* ------------------------------------------------------- the three keys -----
+ * The keys are read THROUGH the ZL38063 audio front-end, not from an ESP32 GPIO
+ * and not from the AW9106B (see b220_buttons.h / .c and BUTTON-HARDWARE-REVERSE.md).
+ *
+ * THE TWO REGISTERS (measured on this unit, then confirmed independently):
+ *
+ *   HBI 0x0000  "status"  0x0000 idle, 0x0003 PRESS, 0x0002 RELEASE.
+ *                         **bit 0 tells a press from the release.**
+ *   HBI 0x0002  "key"     the key code, valid while status != 0:
+ *                         0x0008 = volume up, 0x000A = volume down,
+ *                         0x000B = record / MIC (the talk key).
+ *
+ * ONE PHYSICAL PRESS PRODUCES TWO EVENTS - a press (status bit0 = 1) and a
+ * release (status = 0x0002) - and the driver acts only on the press.  Acting on
+ * both is what made an early revision run every function twice.
+ *
+ * THE MAPPING IS CONFIRMED TWICE:
+ *   - the hardware owner pressed one key at a time and reported 0x000B = record,
+ *     0x0008 = volume up, 0x000A = volume down;
+ *   - the independent open-source port of this same toy, ref/Flower_modou
+ *     (components/modou_drivers/modou_dsp_keys.c), names exactly the same codes:
+ *     `case 0x08: return "VOL+"; case 0x0a: return "VOL-"; case 0x0b: return "MIC";`
+ *
+ * If a key ever does the wrong thing, these three values are the only thing to
+ * swap: the driver logs the raw key and status of every action it takes. */
+#define B220_BUTTON_KEY_1          0x000B  /* record / talk key */
+#define B220_BUTTON_KEY_2          0x0008  /* volume up         */
+#define B220_BUTTON_KEY_3          0x000A  /* volume down       */
+
+/* Poll cadence and long-press threshold, both copied from the stock firmware:
+ * gpioclear = 10 ticks (10 ms), gpiolongpress = 2000 ticks (2 s). */
+#define B220_BUTTON_POLL_MS        10
+/* THERE IS NO LONG PRESS ON THIS HARDWARE - and no macro for one any more.
+ *
+ * Measured with an instrumented build: a deliberate 4-second hold and a
+ * 0.3-second tap produce exactly the same sequence on this interface - one
+ * 0x0003 carrying the key code, then nothing but 0x0000, and 0x0002 about
+ * 140..200 ms later regardless of how long the key was really held.  GPIO38 reads
+ * HIGH throughout a hold.  The hold duration is simply not observable.
+ *
+ * Three attempts to time a hold (level, event gaps, then the GPIO38 line) all
+ * failed on hardware; the record is in docs/B220-LED-AND-BASE-UART.md §2.6.
+ * Every key press is therefore one action: B220_BUTTON_VOLUME_STEP per press.
+ *
+ * If a "volume to max/min" gesture is wanted later, the honest way is a
+ * double-press or a sequence of presses - not a long press. */
+/* Volume step per key press, and the range it is clamped to. */
+#define B220_BUTTON_VOLUME_STEP    10
+/* Double-press window for the volume keys: one press steps the volume, two
+ * presses of the SAME key inside this window jump straight to the end of the
+ * range.  (A double press is used instead of a long press because this front-end
+ * cannot report how long a key was held - see b220_buttons.h.)
+ *
+ * The single-press step is deferred by this long, so that a double press never
+ * moves one step first and then jumps.  Shorter feels snappier but is easier to
+ * miss; 400 ms is the usual double-click budget. */
+#define B220_BUTTON_DOUBLE_CLICK_MS 400
+#define B220_BUTTON_VOLUME_MIN     0
+#define B220_BUTTON_VOLUME_MAX     100
+
+/* ------------------------------------------------------------- indicator --
+ * The board's own indicator lights are AW9106B constant-current channels, not
+ * GPIOs (see b220_led.h).  b220_led.c drives registers 0x23/0x24 and leaves the
+ * LCD backlight channels 0x20/0x21/0x22 to InitializeBacklight(), which sets
+ * them to 0x3F from the stock sequence.
+ *
+ * The two indicator channels were left at 0x80 by the factory replay and nothing
+ * ever touched them again before this.  Confirming WHICH physical light each
+ * channel is still needs a bench check: the independent port of this toy treats
+ * 0x20/0x21/0x22 as a top RGB LED, but on this unit those three are the LCD
+ * backlight (writing 0x3F there is what lit the panel), so the mapping is NOT
+ * copied over - see B220-LED-AND-BASE-UART.md. */
+#define B220_LED_INDICATOR_IDLE_LEVEL 0x00   /* dark while idle (power saving) */
+
+/* TEMPORARY bring-up diagnostic: print the FreeRTOS task list (name/state/priority/
+ * stack/core) every 10 s from the indicator task, so a suspected CPU hog can be
+ * identified from real data instead of from the watchdog's "currently running"
+ * line.  Set to 0 for production. */
+#define B220_DIAG_TASK_STATS 0
+
+/* ------------------------------------------------------- baseboard UART ----
+ * The baseboard MCU (motors, head/tail lights) is on UART0 at 115200 8N1, the
+ * same pins as the console and the flashing port: TX GPIO1 / RX GPIO3.  This is
+ * confirmed by the porting guide's reading of the stock firmware and by the
+ * independent port of this toy (ref/Flower_modou), which drives UART_NUM_0 on
+ * GPIO1/3.
+ *
+ * B220_BASE_UART_HANDSHAKE sends "AT+Pon" once shortly after boot; the stock uses
+ * that to wake the baseboard and it is what unlocks the motors.  It is safe with
+ * the console sharing the wire: the baseboard ignores text it does not recognise,
+ * which is how the stock firmware's own log spam coexists with it. */
+#define B220_BASE_UART_HANDSHAKE   1
+/* Wait this long before the first frame so the ROM banner and the early log burst
+ * are out of the way. */
+#define B220_BASE_UART_HANDSHAKE_DELAY_MS 3000
 
 /* Panel backlight lives on the AW9106B LED driver, not on a GPIO. */
 #define B220_AW9106_I2C_SDA   GPIO_NUM_18
