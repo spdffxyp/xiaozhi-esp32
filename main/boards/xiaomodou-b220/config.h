@@ -282,10 +282,32 @@
  * The two indicator channels were left at 0x80 by the factory replay and nothing
  * ever touched them again before this.  Confirming WHICH physical light each
  * channel is still needs a bench check: the independent port of this toy treats
- * 0x20/0x21/0x22 as a top RGB LED, but on this unit those three are the LCD
- * backlight (writing 0x3F there is what lit the panel), so the mapping is NOT
- * copied over - see B220-LED-AND-BASE-UART.md. */
+ * 0x20/0x21/0x22 as a top RGB LED, and that mapping DOES hold on this unit: the
+ * six RGB LEDs are in parallel, common anode, with R/G/B on OUT0/OUT1/OUT2, i.e.
+ * reg 0x20/0x21/0x22.  They need the output driver configured (0x15/0x16) and
+ * GPMD_A = 0x0A to sink current at all - see B220-LED-AND-BASE-UART.md.
+ *
+ * 0x23/0x24 are the LCD BACKLIGHT on this unit (measured), and this port parks
+ * them at 0x80, the factory value. */
 #define B220_LED_INDICATOR_IDLE_LEVEL 0x00   /* dark while idle (power saving) */
+
+/*
+ * LCD backlight ceiling, 0..255.  Measured 2026-10-10: the panel is brighter at
+ * every step up to 0xFF, so 0xFF is the hardware maximum.  The port still uses
+ * 0x80 at boot because that is the factory value and raising it costs current and
+ * panel heat; change this AND the {0x23, ...}/{0x24, ...} entries in
+ * InitializeBacklight() together if a brighter panel is wanted.
+ */
+#define B220_LED_BACKLIGHT_MAX 0xFF
+
+/* ONE-SHOT BENCH MEASUREMENT, off in production: with this set to 1, the boot
+ * ramps the LCD backlight through 0x3F/0x80/0xBF/0xE0/0xFF (3 s each) and logs
+ * every step, to establish the backlight's usable range.  Measured 2026-10-10:
+ * the panel gets brighter at every step and 0xFF is the brightest, i.e. the
+ * backlight uses the same 8-bit DIM range as the RGB channels (datasheet 9.2).
+ * The port still PARKS it at 0x80 - the factory value - because raising it is a
+ * power/heat decision, not a correctness one (see B220_LED_BACKLIGHT_MAX below). */
+#define B220_LED_WALK 0
 
 /* TEMPORARY bring-up diagnostic: print the FreeRTOS task list (name/state/priority/
  * stack/core) every 10 s from the indicator task, so a suspected CPU hog can be

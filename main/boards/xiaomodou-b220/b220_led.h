@@ -1,46 +1,50 @@
 /*
- * b220_led.h - the board's own indicator lights, which live on the AW9106B.
+ * b220_led.h - the board's RGB indicator light, which lives on the AW9106B.
  *
- * WHAT IS ON THIS CHIP (and what is not)
- * --------------------------------------
- * The B220's status/indicator lights are not GPIOs: they are constant-current
- * channels of the AW9106B LED driver on I2C0 at 7-bit address 0x5B, the same
- * chip that drives the LCD backlight and the AW8737S amplifier's SHDN line.
+ * WHAT IS ACTUALLY ON THIS CHIP (measured on the bench, 2026-10-10)
+ * ----------------------------------------------------------------
+ * The indicator is not a GPIO.  It is six RGB LEDs wired IN PARALLEL, COMMON
+ * ANODE, with R, G and B on the AW9106B's OUT0, OUT1 and OUT2.  Those outputs are
+ * constant-current channels controlled by the DIM registers:
  *
  *   channel register   this board
  *   ----------------   ------------------------------------------------------
- *   0x20 / 0x21 / 0x22 LCD BACKLIGHT - owned by InitializeBacklight(), which
- *                      writes 0x3F to all three (the stock firmware's own
- *                      values).  This module may DIM them but never turns them
- *                      into a colour light.
- *   0x23 / 0x24        the two indicator channels.  InitializeBacklight() leaves
- *                      them at 0x80; they are what this module animates.
- *   0x25               not used by this port.
+ *   0x20 = DIM0/OUT0   RED    of the six parallel RGB LEDs
+ *   0x21 = DIM1/OUT1   GREEN  of the six parallel RGB LEDs
+ *   0x22 = DIM2/OUT2   BLUE   of the six parallel RGB LEDs
+ *   0x23 = DIM3        LCD backlight (measured: writing it changes the panel
+ *                      brightness, and a low value switches the panel off)
+ *   0x24 = DIM4        LCD backlight-related (same, with pulse-engine behaviour)
+ *   0x25 = DIM5        not connected on this unit
  *
- * The head/tail lights are NOT here: they are on the baseboard and are driven
- * over the baseboard UART (see b220_base_uart.h).
+ * Three earlier versions of this file got that mapping wrong - first reading
+ * 0x20..0x22 as the backlight, then concluding the LEDs were "not connected".
+ * Both mistakes came from driving DIMx with the value the other port of this toy
+ * uses (0x3F) without the output-driver configuration that makes the constant
+ * current flow at all.  See docs/B220-LED-AND-BASE-UART.md for the full record.
  *
- * The node-0x19 device on the same I2C bus is an accelerometer (SC7A20), not a
- * light driver.
+ * WHY THE LEDS STAY DARK WITHOUT MORE THAN A DIM WRITE
+ * ---------------------------------------------------
+ * DIMx is EIGHT bits (AW9106B datasheet 9.2: "8-bits DIMx can be configured to 256
+ * levels, from 00H to FFH"), so 0x3F is only 25% brightness - but that is not why
+ * they were dark.  OUTx power up as GPIO and only become current sinks once the
+ * output driver is configured, which needs two registers this port had never
+ * written (0x15 <- 0x1B, 0x16 <- 0x08), and which the board's boot sequence now
+ * writes.  With them, 0x20/0x21/0x22 give red, green, blue and white.
  *
- * WHY THIS MODULE EXISTS
- * ----------------------
- * An earlier state of this port had no way to read or drive these channels at
- * all: the boot sequence wrote 0x80 into 0x23/0x24 and nothing ever touched them
- * again, so the indicator lights were simply "whatever the factory init left".
- * The reference port of this same toy (ref/Flower_modou, components/modou_drivers/
- * modou_key_lights.c) implements a small effect layer on these channels - idle
- * dark, a short colour flash per key event - and that is what this module
- * reproduces, with one deliberate difference: it never rewrites the backlight
- * channels, because on this board those are the LCD backlight, not an RGB LED.
+ * It also needs the group-A drive mode to include the LED-driver bit: GPMD_A
+ * (register 0x12) is 0x0A, not 0x02 - see xiaomodou_b220.cc, where the same value
+ * also keeps the AW8737S SHDN line working (measured: LEDs AND sound).
  *
- * SAFETY: THE ONE THING THAT MUST NOT MOVE
- * ----------------------------------------
+ * WHAT THIS MODULE MUST NEVER TOUCH
+ * ---------------------------------
  * The AW8737S amplifier's SHDN is bit 1 of register 0x02, and its MODE is chosen
- * by counting rising edges on that line - exactly one rising edge is allowed per
- * boot (PART 2 §9).  Register 0x02, 0x04 and 0x12 are therefore OWNED by the
- * board's PA enable and are never written by this module.  All it touches is
- * 0x20..0x25.
+ * by counting rising edges on that line - exactly one is allowed per boot
+ * (PART 2 §9).  Registers 0x02, 0x04 and 0x12 are owned by the board's PA enable;
+ * 0x23/0x24 are the LCD backlight.  All this module writes is 0x20/0x21/0x22.
+ *
+ * The head/tail lights are NOT here: they are on the baseboard, driven over the
+ * baseboard UART (see b220_base_uart.h).
  */
 
 #ifndef B220_LED_H
@@ -66,63 +70,99 @@ i2c_master_bus_handle_t b220_led_i2c_bus(void);
 
 /*
  * Start the module: it attaches its own read/write device for the AW9106B to the
- * I2C0 bus the board created (it does not own the bus and must not create or
- * free it) and starts the effect servicer.  Safe to call once per boot, after
- * InitializeBacklight().
+ * I2C0 bus the board created (it does not own the bus and must not create or free
+ * it), drives the RGB channels to the idle state and starts the effect servicer.
+ * Safe to call once per boot, after InitializeBacklight().
  */
 esp_err_t b220_led_start(void);
 
 /*
- * Indicator channels, for callers that want to drive one directly.
- * (These are the AUTHORED names for the two channels the factory init leaves at
- * 0x80.  Confirming which physical light each one is - and whether there is a
- * second/third indicator - still needs a bench check; see B220-LED-AND-BASE-UART.md.)
+ * Full-brightness ceiling.  DIMx is 8-bit, so this is the whole range; the
+ * independent port of this toy caps itself at 0x3F (a quarter of it), which is a
+ * dimming preference rather than a hardware limit.  ISEL[1:0] separately selects
+ * the 0..IMAX current range (37 mA at the default).
  */
-typedef enum {
-    B220_LED_INDICATOR_A = 0,   /* AW9106 register 0x23 */
-    B220_LED_INDICATOR_B = 1,   /* AW9106 register 0x24 */
-    B220_LED_INDICATOR_COUNT
-} b220_led_indicator_t;
+#define B220_LED_BRIGHTNESS_MAX 0xFF
 
-#define B220_LED_BRIGHTNESS_MAX 0x3F
+/* An RGB colour: one 0..B220_LED_BRIGHTNESS_MAX value per channel. */
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} b220_led_rgb_t;
 
-/* Set one indicator channel.  brightness 0 = off, B220_LED_BRIGHTNESS_MAX = max. */
-esp_err_t b220_led_set_indicator(b220_led_indicator_t which, uint8_t brightness);
-
-/* Set both indicator channels at once. */
-esp_err_t b220_led_set_both(uint8_t brightness);
+/* Ready-made colours, defined so effects read as intent rather than as numbers. */
+extern const b220_led_rgb_t B220_LED_OFF;
+extern const b220_led_rgb_t B220_LED_RED;
+extern const b220_led_rgb_t B220_LED_GREEN;
+extern const b220_led_rgb_t B220_LED_BLUE;
+extern const b220_led_rgb_t B220_LED_WHITE;
+extern const b220_led_rgb_t B220_LED_YELLOW;
+extern const b220_led_rgb_t B220_LED_CYAN;
+extern const b220_led_rgb_t B220_LED_MAGENTA;
 
 /*
- * LCD backlight level, 0..B220_LED_BRIGHTNESS_MAX.  This is the only writer of
- * 0x20/0x21/0x22 outside InitializeBacklight() (which sets them to max at boot),
- * and it is how a "screen dim/wake" style effect would be done.  It never
- * changes the panel's DISPLAY_ON/OFF state.
+ * Drive the RGB light to a colour immediately (each channel is clamped to
+ * B220_LED_BRIGHTNESS_MAX and written to 0x20/0x21/0x22).
  */
-esp_err_t b220_led_set_backlight(uint8_t brightness);
-uint8_t   b220_led_get_backlight(void);
+esp_err_t b220_led_set_color(b220_led_rgb_t color);
+
+/* The colour currently being shown (or the last one written). */
+b220_led_rgb_t b220_led_get_color(void);
+
+/* The last colour passed to b220_led_set_level(), before it was scaled. */
+b220_led_rgb_t b220_led_get_base_color(void);
 
 /*
- * A short two-pulse blink on the indicator channels, used to acknowledge a key
- * press or a state change.  Non-blocking: the effect is serviced by this
- * module's own task, so calling it from an audio callback is safe.
+ * Write `color` scaled by `level` (0..255).  This is the primitive an animation
+ * is built from - the breathing policy calls it with a rising and falling level.
+ * Calling it does NOT cancel a running pulse; use b220_led_set_color() when a
+ * direct, unscaled colour is meant.
  */
-esp_err_t b220_led_flash(uint8_t brightness, uint32_t on_ms, uint32_t off_ms, uint32_t pulses);
+esp_err_t b220_led_set_level(b220_led_rgb_t color, uint8_t level);
 
-/* The "I am alive / something happened" one-shot used by the board. */
+/*
+ * A short colour pulse: the light goes to `color` for on_ms, then to `then_color`
+ * (pass B220_LED_OFF to end dark).  Non-blocking - the effect is serviced by this
+ * module's own task, so calling it from an audio or key callback is safe.  A new
+ * call replaces the one in progress.
+ */
+esp_err_t b220_led_pulse(b220_led_rgb_t color, uint32_t on_ms, b220_led_rgb_t then_color);
+
+/*
+ * The "something happened" one-shot the board uses on a key press: a short white
+ * flash back to the idle colour.  Kept as a named helper because every key path
+ * wants exactly this.
+ */
 esp_err_t b220_led_blink_once(void);
 
 /*
- * Set the LED state hook up to the device state: this board has no per-state
- * colour LED, so the hook only adds a short blink on the transitions worth
- * noticing (idle -> listening, i.e. the user is being listened to).
+ * Hold a colour for `hold_ms` and then return to the idle colour.  Used for
+ * states that last a while (listening, connecting).
+ */
+esp_err_t b220_led_show_temporary(b220_led_rgb_t color, uint32_t hold_ms);
+
+/* True while a pulse is still running (used by the light policy to keep its hands
+ * off a key-press acknowledgement that is mid-flight). */
+bool b220_led_fx_active(void);
+
+/*
+ * Set the idle colour: what the light returns to when nothing else is happening.
+ * Default is B220_LED_OFF (dark), which is what a toy should do when idle.
+ */
+void b220_led_set_idle_color(b220_led_rgb_t color);
+
+/*
+ * Set the LED state hook up to the device state machine: a short colour pulse on
+ * the transitions worth noticing (idle -> listening).  Disabled by default.
  */
 void b220_led_set_state_hook(bool enabled);
 
 typedef struct {
-    bool present;          /* the AW9106B answered on I2C */
+    bool present;             /* the AW9106B answered on I2C */
     bool started;
-    uint8_t backlight;     /* last value written to 0x20/0x21/0x22 */
-    uint8_t indicator[B220_LED_INDICATOR_COUNT];
+    uint8_t rgb[3];           /* the last values written to 0x20/0x21/0x22 */
+    uint8_t backlight[2];     /* the last values written to 0x23/0x24, for diagnosis */
     esp_err_t last_error;
 } b220_led_state_t;
 void b220_led_get_state(b220_led_state_t* out);

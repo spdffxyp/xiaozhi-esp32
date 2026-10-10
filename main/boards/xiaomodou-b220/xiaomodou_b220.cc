@@ -16,6 +16,7 @@
 #include "b220_buttons.h"
 #endif
 #include "b220_led.h"
+#include "b220_led_policy.h"
 #include "b220_base_uart.h"
 /*
  * config.h must come BEFORE zl38063_dsp.h: zl38063_dsp.h exposes the
@@ -788,7 +789,25 @@ static esp_err_t B220_I2sUpBeforeDspBoot() {
 #define B220_AW9106_REG_OUT_A       B220_LOOPBACK_PA_REG /* 0x02 GPIO_OUTPUT_A  */
 #define B220_AW9106_REG_GPIO_CFG_A  0x04 /* GPIO_CFG_A: per-pin GPIO config      */
 #define B220_AW9106_REG_GPMD_A      0x12 /* GPMD_A: group-A drive mode select    */
-#define B220_AW9106_GPMD_A_GPIO     0x02 /* the mode in which SHDN can move      */
+/*
+ * GPMD_A = 0x0A, NOT 0x02.
+ *
+ * 0x02 is the group-A "GPIO/logic output" bit, which is what lets group-A OUT1
+ * move the AW8737S SHDN line (the PA enable walk proved that).  0x08 is the
+ * group-A "LED driver" bit (AW9106B datasheet tables 4/5: OUTx power up as GPIO
+ * and are switched to LED driver mode through GPMD_A/GPMD_B), which is what the
+ * six common-anode RGB LEDs on OUT0/OUT1/OUT2 need - and the stock tail's
+ * 0x12 <- 0x08 was deleted from this port precisely because on its own it
+ * silenced the PA.
+ *
+ * 0x0A sets BOTH bits, and was measured on this hardware: with GPMD_A = 0x0A the
+ * RGB channels light (0x20 = red, 0x21 = green, 0x22 = blue, all three = white)
+ * AND the speaker still works.  So the LED driver bit and the SHDN logic bit do
+ * not have to be exclusive after all; the value this port pins GPMD_A to is the
+ * combination.  Everything that writes 0x12 must use THIS value, because a second
+ * different value would be a mode change on a latching amplifier input.
+ */
+#define B220_AW9106_GPMD_A_GPIO     0x0A /* GPIO bit | LED-driver bit (see above) */
 #define B220_AW9106_GPIO_CFG_A_GPIO 0x00 /* every group-A pin a plain output     */
 
 /* ============================ AW8737S SHDN pulse ==========================
@@ -3021,15 +3040,36 @@ static void B220_VolumeTimerCb(void* arg) {
     B220_ButtonSetVolume(s_b220_pending_up, /*jump=*/false);
 }
 
+/*
+ * Say WHICH key was accepted, not merely that one was: the indicator is an RGB
+ * light (six parallel LEDs on the AW9106B's OUT0/OUT1/OUT2 - see b220_led.h), so
+ * the colour can carry the meaning.  All of these are non-blocking: b220_led.c
+ * services the effect on its own task, which is why calling this from the key
+ * poller's task is safe.
+ */
+static void B220_KeyFeedback(b220_button_action_t action) {
+    switch (action) {
+    case B220_BTN_ACTION_RECORD:
+        /* White: the talk key, which is also what a wake word does. */
+        (void)b220_led_pulse(B220_LED_WHITE, 140, B220_LED_OFF);
+        break;
+    case B220_BTN_ACTION_VOLUME_UP:
+        (void)b220_led_pulse(B220_LED_GREEN, 120, B220_LED_OFF);
+        break;
+    case B220_BTN_ACTION_VOLUME_DOWN:
+        (void)b220_led_pulse(B220_LED_RED, 120, B220_LED_OFF);
+        break;
+    default:
+        (void)b220_led_pulse(B220_LED_BLUE, 120, B220_LED_OFF);
+        break;
+    }
+}
+
 static void B220_ButtonAction(b220_button_action_t action) {
     Application& app = Application::GetInstance();
 
-    /*
-     * Acknowledge every accepted key action on the board's indicator lights.
-     * Non-blocking: b220_led.c services the effect on its own task.  This is the
-     * only feedback the toy can give without the screen.
-     */
-    (void)b220_led_blink_once();
+    /* Colour-coded acknowledgement on the RGB indicator. */
+    B220_KeyFeedback(action);
 
     switch (action) {
     case B220_BTN_ACTION_RECORD:
@@ -3320,7 +3360,9 @@ private:
         static const uint8_t init_seq[][2] = {
             {0x7F, 0x00},  // software reset
             {0x11, 0x10},  // CTL
-            {0x12, 0x02},  // GPMD_A = the group-A GPIO/output mode (0x08 kills the PA)
+            {0x12, 0x0A},  // GPMD_A = GPIO bit | LED-driver bit: SHDN can move AND the
+                           // six common-anode RGB LEDs on OUT0/1/2 can be driven (0x08
+                           // alone drives the LEDs but was measured to silence the PA)
             {0x04, 0x00},  // GPIO_CFG_A = all group-A pins outputs
             /* NO {0x02, ...} HERE - the audio PA's SHDN line is reg 0x02 bit 1 and
              * the AW8737S counts 0 -> 1 transitions as MODE SELECTIONS (see the
@@ -3352,11 +3394,31 @@ private:
              * on this hardware, so it is NOT used here: 0x02 is the value that was
              * audible, and the DIM registers below (0x20..0x25) are the ones that
              * actually set the backlight level. */
-            {0x20, 0x3F},  // DIM0 = max  <- backlight
-            {0x21, 0x3F},  // DIM1 = max  <- backlight
-            {0x22, 0x3F},  // DIM2 = max  <- backlight
-            {0x23, 0x80},  // DIM3 (indicator)
-            {0x24, 0x80},  // DIM4 (indicator)
+            /* DIM0/1/2 = the six parallel common-anode RGB LEDs on OUT0/1/2, which
+             * b220_led.c drives.  They start OFF, and that is what the module's idle
+             * state means.  (This port used to park them at 0x3F, believing they were
+             * the backlight: at 25% of an 8-bit range nothing was visible, which is
+             * what made the RGB LEDs look unconnected.) */
+            {0x20, 0x00},  // DIM0 = OUT0 = RED   - driven by b220_led.c
+            {0x21, 0x00},  // DIM1 = OUT1 = GREEN - driven by b220_led.c
+            {0x22, 0x00},  // DIM2 = OUT2 = BLUE  - driven by b220_led.c
+            /* DIM3/DIM4 are the LCD backlight on this unit: measured, and the reason
+             * this module never drives them below 0x80 (a lower level switched the
+             * panel off). */
+            /* The backlight could go brighter (measured: 0xFF is the brightest, the
+             * panel steps up at every value), but 0x80 is the FACTORY value and this
+             * port keeps it: brightness is a power/heat trade-off, not a correctness
+             * issue.  Must stay >= 0x80 - a lower value switched the panel off. */
+            {0x23, 0x80},  // DIM3 = LCD backlight (factory value; see config.h)
+            {0x24, 0x80},  // DIM4 = LCD backlight-related
+            /* The output-driver configuration WITHOUT which the RGB channels stay dark
+             * even at DIMx = 0xFF.  Both values are taken from the independent port of
+             * this toy, which lights the same LEDs; neither register was ever written
+             * by this port before.  Measured afterwards on this board: with these two
+             * writes plus DIMx, OUT0/1/2 light red/green/blue/white. */
+            {0x15, 0x1B},  // output driver config (never written before; see above)
+            {0x16, 0x08},  // output driver config (never written before; see above)
+            {0x14, 0x00},  // steady output: no breathing/pulse override of the DIM values
         };
         for (auto& kv : init_seq) {
             /* The two DRIVE-MODE registers (0x12 GPMD_A, 0x04 GPIO_CFG_A) go through
@@ -4077,9 +4139,12 @@ public:
             }
         }
         ESP_LOGI(TAG, "board init: indicator-light module returned");
-        /* One acknowledgement blink so the indicator path is visibly alive. */
-        b220_led_blink_once();
-        ESP_LOGI(TAG, "board init: acknowledgement blink requested");
+        /*
+         * No boot blink: the indicator is dark at rest (see b220_led.c), and the
+         * panel plus the audio bring-up already show the device is alive.  The
+         * RGB light is exercised by the key feedback instead.
+         */
+        ESP_LOGI(TAG, "board init: RGB indicator left DARK at rest (no boot blink)");
         /*
          * Baseboard link (motors, head/tail lights) on UART0 - the same wire as
          * the console.  Only the "AT+Pon" handshake is sent automatically; motion
@@ -4101,6 +4166,19 @@ public:
          * the log: everything after this point simply never ran.  With this
          * marker, a stall is obvious and its location is between two lines.
          */
+        /*
+         * The light policy goes last: it samples the device state and drives the RGB
+         * indicator (red = no cloud connection, white breathing = listening/speaking,
+         * dark = ready and idle).  See b220_led_policy.c.
+         */
+        {
+            const esp_err_t pol_err = b220_led_policy_start();
+            if (pol_err != ESP_OK) {
+                ESP_LOGW(TAG, "board init: the RGB light policy did not start (%s)",
+                         esp_err_to_name(pol_err));
+            }
+        }
+
         ESP_LOGI(TAG, "board init complete: display, keys, indicator lights and the baseboard "
                       "link are up (application start follows)");
 #if B220_BACKLIGHT_SWEEP
