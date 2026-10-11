@@ -402,6 +402,72 @@ rst:0xc (SW_CPU_RESET)
 
 ---
 
+## 2.9a-pre2 ✅ 灯光策略上机验证通过（2026-10-11 08:07，`logs/boot-20261011-080701.log`）
+
+### 策略（用户确认的最终版）
+
+| 设备状态 | 灯 |
+| --- | --- |
+| 启动 / 配网 / 连接中 | 红色**呼吸** |
+| 曾连上但**断链** | 红色**常亮**（需要用户处理） |
+| **聆听中** | **绿色呼吸** |
+| **说话中** / 通知中 | **白色呼吸** |
+| 激活中 / 升级中 | 紫色呼吸（别断电） |
+| 就绪空闲 | 蓝色**微光**（12%，不是全灭） |
+| 致命错误 | 红色快闪 |
+| 按键反馈（最高优先） | 录音白闪 / 音量+绿闪 / 音量−红闪 |
+
+设计要点：**一色一义**（红=连接有问题、绿=轮到你说、白=轮到你听、紫=维护、蓝=待机）；
+**呼吸=进行中/等待，常亮=需要你处理，快闪=出故障**；语音类呼吸 1.6 s、非语音类 3 s
+（连接可能持续十几秒，快脉动看起来像恐慌）；按键反馈永远优先，否则"没网时的红"会吞掉按键确认。
+
+### 实测轨迹（与设计逐条一致）
+
+```
+ 6326  RED breathing (no cloud yet)   unknown       开机
+ 8806  MAGENTA breathing              activating    激活服务器
+14336  RED breathing (no cloud yet)   connecting    开始会话
+14486  GREEN breathing (listening)    listening     用户说话
+19046  WHITE breathing (speaking)     speaking      机器回答
+29496  GREEN breathing (listening)    listening     第二轮
+33096  WHITE breathing (speaking)     speaking
+36126  GREEN breathing (listening)    listening
+```
+
+### ★ 这一步踩了两个"看着对、其实没接上"的坑（方法论）
+
+**要拿到"真实链路状态"**，因为设备状态机不够用：`Application::HandleNetworkDisconnectedEvent()`
+**不会改变设备状态**，"连上后掉线"若只看状态机就仍然显示待机灯。
+
+| 尝试 | 结果 |
+| --- | --- |
+| ① 遮蔽 `WifiBoard::OnNetworkEvent` | ❌ **静默失效**：该方法**非虚**，而 `WifiBoard::Initialize()` 在它自己捕获的 **`WifiBoard*`** 上调用它 ⇒ **静态绑定**，派生版本永不被调用。**能编译、看着对、什么都没发生** |
+| ② 重写 `SetNetworkEventCallback` 包装 Application 的回调 | ❌ 同样不可靠：`WifiBoard::Initialize()` 在**构造函数里**就把自己的 lambda 直接注册给 WifiManager，根本不经过这个虚函数 |
+| ③ **直接查询 `WifiManager::IsConnected()`** | ✅ 公开 API、同步、无中间环节 |
+
+①为什么会被发现：**我当时给这条路径加了两行日志**（`network: CONNECTED/DISCONNECTED`），
+上机后日志**一行都没打印**，于是立刻定位到"分发根本没生效"，而不是去猜策略逻辑。
+
+> **教训：不可观测的接法等于没接。** 任何"新增一条数据通路"的改动，都必须带一条能证明它被走到的日志；
+> 否则现象只会表现为"灯不对/功能不生效"，而人会在错误的地方（策略逻辑）反复排查。
+
+③的验证也用**反汇编**而不是字符串搜索：
+```
+400f547b: call8 <WifiManager::GetInstance()>
+400f547e: call8 <WifiManager::IsConnected() const>    ← 确实在查
+400f548f: call8 <b220_led_fx_active>                   ← 优先级仍在
+```
+（`nm -C` 一开始搜不到是因为符号是 C++ 修饰名 `_ZNK11WifiManager11IsConnectedEv`；
+另外 ESP-IDF 会把日志格式串去重进格式表，**所以"在镜像里搜字符串"不是可靠的验证手段** —— 它一度让我
+误判自己的实现缺失。）
+
+### 另一处可观测性修正
+
+"就绪空闲"那条日志原本是 `ESP_LOGD`，运行时级别把它过滤掉了 ⇒ 蓝光**工作正常但在 trace 里看不见**。
+已改为 `ESP_LOGI`：这块板子唯一的用户反馈就是这盏灯，每次策略切换都值得留一行。
+
+---
+
 ## 2.9a-pre ✅ RGB 指示灯通了（2026-10-10 晚，实测定性）
 
 ### 一句话

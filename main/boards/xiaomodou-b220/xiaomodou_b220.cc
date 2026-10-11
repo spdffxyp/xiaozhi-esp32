@@ -3314,6 +3314,8 @@ private:
     LcdDisplay* display_ = nullptr;
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
 
+protected:
+
     /*
      * The panel backlight is NOT a GPIO on this board: the stock firmware never
      * drives one.  It brings up the AW9106B LED driver on I2C0 (0x5B, SDA 18 /
