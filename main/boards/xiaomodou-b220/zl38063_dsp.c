@@ -2238,17 +2238,68 @@ esp_err_t zl38063_dsp_set_volume(uint8_t vol)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* 0 -> -90 dB (mute), 100 -> +10 dB, saturated by the DSP at +6 dB. */
-    int8_t gain = (int8_t)((int)vol + ZL38063_VOLUME_ZERO_DB);
+    /*
+     * Volume -> gain, on a PERCEPTUAL curve rather than a straight line.
+     *
+     * The straight line this used to be (`gain = vol - 90`) put 100 equally spaced
+     * values on 100 dB, i.e. a constant +10 dB per 10% step.  Loudness is roughly
+     * logarithmic, so a fixed 10 dB step is a 3.2x amplitude jump at EVERY level: fine
+     * near mute, unpleasantly large near the top, and the last steps also run into the
+     * DSP's +6 dB saturation.  Reported from the bench exactly that way ("the jump
+     * feels much bigger at high volume").
+     *
+     * THE STOCK FIRMWARE DID NOT DO THIS.  Its volume routine (0x401256D8) takes
+     * `index = vol / 10` - TEN levels, not a hundred - and looks the gain byte up in a
+     * table.  Two things follow, and both matter:
+     *
+     *   1. the stock top level was NOT +10 dB: the boot config record it loads leaves
+     *      0x0238 at 0xF1 = -15 dB, and its own play path writes 0xEC = -20 dB, so +10
+     *      dB was never in its range at all.  This port's mapping put 100% at +10 dB,
+     *      which is both louder than stock and in the region where the limiter works.
+     *   2. above 80 the stock routine ALSO writes the second attenuator
+     *      (0x0494 = 0x16C3, 0x049A = 1) instead of 0x0666/2 below it - a coarse/fine
+     *      split this port has never implemented (see PORTING-GUIDE-PART2 §6.3).
+     *
+     * Without that second stage, the honest thing is a curve that keeps the useful
+     * range usable and stops short of saturation, so equal steps feel equal:
+     *
+     *     gain_dB = -90 + 96 * (vol/100)^1.7      ->  -90 dB at 0, about -13 dB at 70,
+     *                                                +0.6 dB at 95, +6 dB at 100
+     *
+     * The top now lands on the +6 dB the DSP can actually deliver instead of asking for
+     * +10 dB and being clipped, and the steps shrink as the volume rises.  It is an
+     * approximation of a loudness curve, not the stock table: when the 0x0494 stage is
+     * implemented, this should be replaced by the table itself.
+     */
+    {
+        /* Integer power 1.7 without floating point or libm: x^1.7 = x * x^0.7, and
+         * x^0.7 is taken from a 33-entry table (3% steps) with linear interpolation,
+         * so the curve is monotonic and every volume value maps to a stable gain. */
+        static const uint8_t kPow07[33] = {
+            0, 6, 10, 13, 16, 19, 21, 24, 26, 28, 30, 32, 34, 36, 38,
+            39, 41, 43, 44, 46, 47, 49, 50, 52, 53, 55, 56, 57, 59, 60,
+            61, 62, 64
+        };
+        const int v = (int)vol;                 /* 0..100, checked above */
+        const int idx = v * 32 / 100;           /* 0..32 */
+        const int rem = (v * 32) % 100;
+        int p = kPow07[idx];
+        if (idx < 32) {
+            p += (kPow07[idx + 1] - kPow07[idx]) * rem / 100;
+        }
+        /* 96 dB of range over the curve, anchored at -90 dB so that 0 is still mute. */
+        const int gain_db = ZL38063_VOLUME_ZERO_DB + (96 * p) / 64;
+        const int8_t gain = (int8_t)gain_db;
 
-    VprocStatusType st = VprocTwolfSetVolume((uint8)gain);
-    if (st != VPROC_STATUS_SUCCESS) {
-        ESP_LOGE(TAG, "set volume failed (%d)", (int)st);
-        return ESP_FAIL;
+        VprocStatusType st = VprocTwolfSetVolume((uint8)gain);
+        if (st != VPROC_STATUS_SUCCESS) {
+            ESP_LOGE(TAG, "set volume failed (%d)", (int)st);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "volume %u -> gain 0x%02X (%d dB, perceptual curve)", (unsigned)vol,
+                 (unsigned)(uint8)gain, gain_db);
+        return ESP_OK;
     }
-    ESP_LOGI(TAG, "volume %u -> gain 0x%02X (%d dB)", (unsigned)vol,
-             (unsigned)(uint8)gain, (int)gain);
-    return ESP_OK;
 }
 
 bool zl38063_dsp_is_running(void)

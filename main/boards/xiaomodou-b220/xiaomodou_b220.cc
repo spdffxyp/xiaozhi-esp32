@@ -3026,20 +3026,23 @@ static void B220_ButtonSetVolume(bool up, bool jump) {
              before, volume);
 }
 
-/* The deferred single-press step, and the state that decides whether a second
- * press upgrades it to a jump. */
-static esp_timer_handle_t s_b220_volume_timer = nullptr;
-static bool s_b220_pending_valid = false;      /* a step is waiting on the timer */
-static bool s_b220_pending_up = false;
-
-static void B220_VolumeTimerCb(void* arg) {
-    (void)arg;
-    if (!s_b220_pending_valid) {
-        return;
-    }
-    s_b220_pending_valid = false;
-    B220_ButtonSetVolume(s_b220_pending_up, /*jump=*/false);
-}
+/*
+ * Double press: the FIRST press acts immediately (one step, exactly like any other
+ * press), and a SECOND press of the same key within B220_BUTTON_DOUBLE_CLICK_MS is
+ * taken as "go to the end of the range".
+ *
+ * The first version deferred the step by the whole double-click window, so that a
+ * double press would never move one step before jumping.  That was the wrong
+ * trade-off for this hardware: it put a ~400 ms lag on every ordinary volume press,
+ * which is what a user actually does most of the time.  Acting immediately and
+ * upgrading the second press costs one step of overshoot on a double press, which
+ * the jump to the limit absorbs anyway, and removes the lag from the common path.
+ *
+ * The state is two variables rather than a timer, so nothing has to be created,
+ * cancelled or cleaned up: s_last_volume_us records the previous press.
+ */
+static bool s_last_volume_up = false;
+static int64_t s_last_volume_us = 0;
 
 /*
  * Say WHICH key was accepted, not merely that one was: the indicator is an RGB
@@ -3084,38 +3087,25 @@ static void B220_ButtonAction(b220_button_action_t action) {
     case B220_BTN_ACTION_VOLUME_UP:
     case B220_BTN_ACTION_VOLUME_DOWN: {
         const bool up = (action == B220_BTN_ACTION_VOLUME_UP);
+        const int64_t now_us = esp_timer_get_time();
 
-        if (s_b220_pending_valid && s_b220_pending_up == up) {
-            /* Second press of the SAME key inside the window: this is a double
-             * press, so cancel the waiting step and jump instead. */
-            s_b220_pending_valid = false;
-            if (s_b220_volume_timer != nullptr) {
-                (void)esp_timer_stop(s_b220_volume_timer);
-            }
-            ESP_LOGI(TAG, "key %s: double press detected", up ? "VOLUME_UP" : "VOLUME_DOWN");
+        /* A press of the same key inside the window is the second half of a double
+         * press: jump to the end of the range.  The step the first press already
+         * applied is absorbed by the jump. */
+        const bool double_press =
+            (up == s_last_volume_up) && (s_last_volume_us != 0) &&
+            ((now_us - s_last_volume_us) < (int64_t)B220_BUTTON_DOUBLE_CLICK_MS * 1000);
+
+        s_last_volume_up = up;
+        s_last_volume_us = now_us;
+
+        if (double_press) {
+            ESP_LOGI(TAG, "key %s: double press -> jump to the %s of the range",
+                     up ? "VOLUME_UP" : "VOLUME_DOWN", up ? "top" : "bottom");
             B220_ButtonSetVolume(up, /*jump=*/true);
-            break;
-        }
-
-        /* First press (or a press of the OTHER volume key): arm a step, to be
-         * applied only if no second press of the same key follows. */
-        if (s_b220_pending_valid && s_b220_volume_timer != nullptr) {
-            /* A different key arrived: flush the pending step now so both actions
-             * are honoured in order. */
-            (void)esp_timer_stop(s_b220_volume_timer);
-            s_b220_pending_valid = false;
-            B220_ButtonSetVolume(s_b220_pending_up, /*jump=*/false);
-        }
-        s_b220_pending_valid = true;
-        s_b220_pending_up = up;
-        if (s_b220_volume_timer != nullptr) {
-            (void)esp_timer_stop(s_b220_volume_timer);
-            (void)esp_timer_start_once(s_b220_volume_timer,
-                                       (uint64_t)B220_BUTTON_DOUBLE_CLICK_MS * 1000);
         } else {
-            /* No timer (creation failed): fall back to acting immediately, so the
-             * key still works - it just loses the double-press upgrade. */
-            s_b220_pending_valid = false;
+            /* One press, one step, applied NOW - no waiting to see whether a second
+             * press follows. */
             B220_ButtonSetVolume(up, /*jump=*/false);
         }
         break;
@@ -3127,28 +3117,6 @@ static void B220_ButtonAction(b220_button_action_t action) {
 }
 
 static void B220_ButtonsStart() {
-    /*
-     * The one-shot that applies a single volume step B220_BUTTON_DOUBLE_CLICK_MS
-     * after the press unless a second press cancels it.  Created here (once per
-     * boot) rather than lazily, so the key handler never has to allocate.
-     */
-    if (s_b220_volume_timer == nullptr) {
-        const esp_timer_create_args_t timer_args = {
-            .callback = B220_VolumeTimerCb,
-            .arg = nullptr,
-            .dispatch_method = ESP_TIMER_TASK,   /* runs in the timer task: safe to call the codec */
-            .name = "b220_volume",
-            .skip_unhandled_events = true,
-        };
-        const esp_err_t terr = esp_timer_create(&timer_args, &s_b220_volume_timer);
-        if (terr != ESP_OK) {
-            s_b220_volume_timer = nullptr;
-            ESP_LOGW(TAG, "volume: esp_timer_create failed (%s); the volume keys will act "
-                          "immediately and lose the double-press jump",
-                     esp_err_to_name(terr));
-        }
-    }
-
     const esp_err_t err = b220_buttons_start(B220_ButtonAction);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "the ZL38063 key poller did not start (%s); the three physical keys "
