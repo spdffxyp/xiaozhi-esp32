@@ -34,6 +34,8 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
+#include <esp_netif.h>
+
 #include <lwip/sockets.h>
 #include <netinet/in.h>
 
@@ -194,6 +196,29 @@ private:
 
     void run()
     {
+        /*
+         * WAIT FOR LWIP BEFORE TOUCHING A SOCKET.
+         *
+         * The static initialiser installs the log hook, which has to happen before
+         * anything logs - but it runs far too early to open a socket.  On this firmware
+         * esp_netif_init()/board.StartNetwork() happen inside Application::Initialize(),
+         * i.e. after the board constructor and long after static initialisation, and
+         * doing it in the initialiser asserted inside lwIP:
+         *
+         *     assert failed: tcpip_send_msg_wait_sem ... (Invalid mbox)
+         *
+         * So the split is: the RING BUFFER and the HOOK start at static-init time (they
+         * need nothing but RAM, and they are what captures the boot log), while the
+         * LISTENER waits here until the network stack exists.  A task context is also
+         * the right place for blocking bind/listen/accept.
+         */
+        if (!wait_for_network()) {
+            /* No network stack ever appeared.  The hook, the ring and the serial dump
+             * fallback all still work, so this is a degraded mode, not a failure. */
+            vTaskDelete(nullptr);
+            return;
+        }
+
         const int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listener < 0) {
             return;
@@ -205,9 +230,19 @@ private:
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons(B220_TCP_LOG_PORT);
-        if (bind(listener, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0 ||
-            listen(listener, B220_TCP_LOG_MAX_CLIENTS) != 0) {
+        bool bound = false;
+        for (int attempt = 0; attempt < 20 && !bound; attempt++) {
+            if (bind(listener, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                listen(listener, B220_TCP_LOG_MAX_CLIENTS) == 0) {
+                bound = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (!bound) {
             close(listener);
+            /* The ring and the hook stay alive, so the serial dump still works. */
+            vTaskDelete(nullptr);
             return;
         }
 
@@ -246,6 +281,24 @@ private:
             }
             pump();
         }
+    }
+
+    /* Poll until the default netif exists, which only happens once esp_netif_init() has
+     * run and the network has been started.  Polling costs one cheap check per second
+     * and removes any need to know this firmware's init order - which is exactly the
+     * assumption that was wrong before. */
+    bool wait_for_network()
+    {
+        for (int attempt = 0; attempt < 60; attempt++) {
+            if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") != nullptr ||
+                esp_netif_get_handle_from_ifkey("WIFI_AP_DEF") != nullptr) {
+                /* Let the stack settle a moment before the first socket. */
+                vTaskDelay(pdMS_TO_TICKS(200));
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        return false;
     }
 
     void accept_client(int listener)
@@ -350,9 +403,12 @@ private:
 };
 
 /*
- * Installed before app_main() by the C++ runtime.  A static initialiser is the
- * earliest point this board can run code (the board constructor is much later), which
- * is why the TCP stream contains the whole boot from the board's first log line on.
+ * Installed before app_main() by the C++ runtime.  A static initialiser is the earliest
+ * point this board can run code (the board constructor is much later), which is why the
+ * TCP stream contains the whole boot from the board's first log line on.
+ *
+ * ONLY the hook and the ring buffer may run this early.  Anything that touches lwIP has
+ * to wait for the network stack - see the wait at the top of TcpLog::run().
  */
 const int kTcpLogInstalled = (TcpLog::instance().start(), 0);
 

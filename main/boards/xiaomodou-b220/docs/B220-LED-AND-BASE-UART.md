@@ -190,6 +190,41 @@ IDF 6.1 **没有**现成的网络日志传输层（只有 `esp_log_set_vprintf()
 **按音量−键** ⇒ 把最近日志从**串口**吐出来。用一个已经有别的职责的键，是**故意**的：
 调试手段不能依赖于被调试的东西。开关 `B220_TCP_LOG_DUMP_ON_VOLUME_DOWN`（默认 1）。
 
+### ★ 上机第一次就崩了：静态初始化里不能碰 lwIP
+
+第一版把"创建并 bind 监听 socket"也放在静态初始化里（和钩子一起），上机立即：
+
+```
+assert failed: tcpip_send_msg_wait_sem /components/lwip/lwip/src/api/tcpip.c:454 (Invalid mbox)
+```
+
+**根因**：板级构造函数在 `Application::Initialize()` 第 62 行就被触发（`Board::GetInstance()`），
+而 **`board.StartNetwork()` 在第 170 行** —— 也就是说**静态初始化时 lwIP 的 mbox 还不存在**，
+建 socket 必然断言失败。
+
+**修法：把"装钩子"和"开 socket"分开**
+
+| 部分 | 何时运行 | 为什么 |
+| --- | --- | --- |
+| 钩子 + 环形缓冲 | **静态初始化**（最早） | 只用到 RAM；**必须最早**才能抓到启动日志 |
+| 监听 socket | **TCP 任务里**，先 `wait_for_network()` 轮询默认 netif 出现 | socket 属于 lwIP；任务上下文也本就适合阻塞式 bind/accept |
+
+反汇编验证（`task_entry` 内联了 `run()`）：
+```
+l32r a8, <esp_netif_get_handle_from_ifkey> ; callx8   <- 先等网络栈
+l32r a8, <vTaskDelay>                      ; callx8   <- 等待/重试
+l32r a8, <lwip_socket>                     ; callx8   <- 之后才建 socket
+l32r a8, <vTaskDelete>                     ; callx8   <- 等不到就优雅降级，不崩
+```
+
+**教训（同一类错误的又一次）**：我上一轮验证了"静态初始化确实调用了 `start()`"，
+但**没有验证"在那个时刻运行是否安全"**。机制被证明了，**前提没有被证明**。
+
+> **静态构造函数里不能碰任何子系统**（网络、文件系统、驱动、NVS）—— 那时它们都还没初始化。
+> 静态初始化只适合做"纯内存"的准备（装钩子、备缓冲），凡是需要子系统的动作都要延后到任务里、
+> 并**显式等待**那个子系统就绪，而不是假设初始化顺序。这个项目已经因为"假设顺序"错过多次
+> （编解码器启动、灯光策略、这次的 lwIP），所以正确做法是**轮询到就绪**而不是依赖执行次序。
+
 ### 分两步走（当前是第 1 步）
 
 | 步骤 | 内容 | 状态 |

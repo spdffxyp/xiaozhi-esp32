@@ -40,9 +40,13 @@
 extern "C" {
 #endif
 
-/* Install the log hook, start the ring buffer and the TCP listener.  Safe to call
- * more than once; the second call is a no-op.  Called automatically by a static
- * initialiser, so normally nothing needs to call it explicitly. */
+/* Install the log hook and start the ring buffer.  Safe to call more than once.  Called
+ * automatically by a static initialiser, so normally nothing needs to call it
+ * explicitly.
+ *
+ * The TCP LISTENER inside waits for lwIP before opening a socket: at static-init time
+ * the network stack does not exist yet (opening a socket there asserts inside lwIP), so
+ * only the RAM-only parts start that early. */
 esp_err_t b220_tcp_log_start(void);
 
 /* Print the recent log to the serial port (the fallback above). */
