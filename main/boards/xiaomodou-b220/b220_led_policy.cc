@@ -68,8 +68,13 @@ static const char* TAG = "b220-policy";
 /* Breathing never reaches zero: a light that goes out looks like a fault rather
  * than a heartbeat. */
 #define B220_POLICY_BREATH_FLOOR     0x20
-/* Idle standby level: dim enough to be ambient, bright enough to prove "I am on". */
-#define B220_POLICY_IDLE_LEVEL       0x1F   /* ~12% of the 8-bit range */
+/*
+ * Idle standby level.  This is the light the user sees almost all the time, so it has
+ * to read as intentional rather than as a barely-alive glow: the first version used
+ * 12%, which proved the device was on but was too faint to serve as an indicator (and
+ * too faint to notice a key-press flash against).  About a third of the range.
+ */
+#define B220_POLICY_IDLE_LEVEL       0x55   /* ~33% of the 8-bit range */
 /* How often a fault light flashes. */
 #define B220_POLICY_FAULT_PERIOD_MS  400
 
@@ -245,8 +250,23 @@ static void policy_apply(DeviceState st, bool force)
     }
 
     if (!force && last_valid && mode == last_mode) {
-        /* Same mode: only the animated ones need continuous updates; the steady ones
-         * have already been written. */
+        /*
+         * The mode has not changed, but this still RE-ASSERTS it on every tick - it is
+         * not a no-op.
+         *
+         * Why: the key-press acknowledgement in b220_led.c drives the same three
+         * registers and ends by returning the light to the idle colour - which is
+         * B220_LED_OFF.  So a volume or record press used to leave the standby light
+         * dark for good: the policy had already written the idle colour once, saw that
+         * its mode was unchanged, and skipped the write from then on.  Reported from
+         * the bench exactly that way ("the light goes out after a volume change").
+         *
+         * Re-asserting every tick also means the light obeys the policy continuously
+         * rather than only at mode transitions, so anything else that touches those
+         * registers cannot leave it in a state the policy did not ask for.  A steady
+         * mode costs one I2C write per tick, which is the same order as the breathing
+         * modes already do.
+         */
         switch (mode) {
         case B220_LIGHT_TRYING:
         case B220_LIGHT_UPGRADING:
@@ -262,7 +282,15 @@ static void policy_apply(DeviceState st, bool force)
             (void)b220_led_set_level(B220_LED_RED,
                                      policy_fault_on(now_us) ? B220_LED_BRIGHTNESS_MAX : 0x00);
             break;
+        case B220_LIGHT_IDLE:
+            (void)b220_led_set_level(B220_LED_BLUE, B220_POLICY_IDLE_LEVEL);
+            break;
+        case B220_LIGHT_NO_CLOUD:
+            (void)b220_led_set_color(B220_LED_RED);
+            break;
+        case B220_LIGHT_OFF:
         default:
+            (void)b220_led_set_color(B220_LED_OFF);
             break;
         }
         return;

@@ -2263,8 +2263,8 @@ esp_err_t zl38063_dsp_set_volume(uint8_t vol)
      * Without that second stage, the honest thing is a curve that keeps the useful
      * range usable and stops short of saturation, so equal steps feel equal:
      *
-     *     gain_dB = -90 + 96 * (vol/100)^1.7      ->  -90 dB at 0, about -13 dB at 70,
-     *                                                +0.6 dB at 95, +6 dB at 100
+     *     gain_dB = -90 + 96 * (vol/100)^1.4      ->  -90 dB at 0, -53 dB at 10,
+     *                                                -8 dB at 70, +6 dB at 100
      *
      * The top now lands on the +6 dB the DSP can actually deliver instead of asking for
      * +10 dB and being clipped, and the steps shrink as the volume rises.  It is an
@@ -2272,20 +2272,35 @@ esp_err_t zl38063_dsp_set_volume(uint8_t vol)
      * implemented, this should be replaced by the table itself.
      */
     {
-        /* Integer power 1.7 without floating point or libm: x^1.7 = x * x^0.7, and
-         * x^0.7 is taken from a 33-entry table (3% steps) with linear interpolation,
-         * so the curve is monotonic and every volume value maps to a stable gain. */
-        static const uint8_t kPow07[33] = {
-            0, 6, 10, 13, 16, 19, 21, 24, 26, 28, 30, 32, 34, 36, 38,
-            39, 41, 43, 44, 46, 47, 49, 50, 52, 53, 55, 56, 57, 59, 60,
-            61, 62, 64
+        /*
+         * Integer power without floating point or libm: the curve is x^1.4, taken as
+         * x * x^0.4 with x^0.4 in a 33-entry table (3.1% steps) and linear
+         * interpolation between entries, so the curve is monotonic and every volume
+         * value maps to a stable gain.
+         *
+         * THE EXPONENT IS THE KNOB FOR THE BOTTOM END, and it was moved because of a
+         * bench report: "at 10% the volume is too low, it should be what 20% used to
+         * be".  At x^1.7 the bottom was -71 dB at 10%; the table below puts it at
+         * -53 dB, close to the -57 dB that 20% used to give, and the TOP IS UNCHANGED
+         * (x=1 still reaches +6 dB, the DSP's real maximum).  Shortening the dB range
+         * instead was tried first and does the opposite - it makes every level quieter
+         * - which is worth remembering: to lift the bottom while pinning the top,
+         * change the SHAPE (the exponent), never the range.
+         *
+         * Values are round((i/32)^0.4 * 64) and the last entry must stay 64 so that
+         * volume 100 lands exactly on the top of the range.
+         */
+        static const uint8_t kPow04[33] = {
+            0, 16, 21, 25, 28, 30, 33, 35, 37, 39, 40, 42, 43, 45, 46,
+            47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            62, 63, 64
         };
         const int v = (int)vol;                 /* 0..100, checked above */
         const int idx = v * 32 / 100;           /* 0..32 */
         const int rem = (v * 32) % 100;
-        int p = kPow07[idx];
+        int p = kPow04[idx];
         if (idx < 32) {
-            p += (kPow07[idx + 1] - kPow07[idx]) * rem / 100;
+            p += (kPow04[idx + 1] - kPow04[idx]) * rem / 100;
         }
         /* 96 dB of range over the curve, anchored at -90 dB so that 0 is still mute. */
         const int gain_db = ZL38063_VOLUME_ZERO_DB + (96 * p) / 64;
