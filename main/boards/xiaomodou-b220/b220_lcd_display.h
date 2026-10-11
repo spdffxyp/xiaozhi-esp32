@@ -1,23 +1,43 @@
 /*
- * b220_lcd_display.h - the B220's screen: the framework's SPI LCD UI plus the two
- * status readouts this toy needs.
+ * b220_lcd_display.h - the B220's screen.
  *
- * What it adds on top of SpiLcdDisplay:
+ * THIS CLASS CURRENTLY ADDS NOTHING.  It is kept as a name, and as the place the status
+ * readouts will go back to, because the implementation that lived here has been REMOVED after
+ * it was found to corrupt LVGL's internal state.
  *
- *   1. The battery as a PERCENTAGE in the top-right corner.  The generic status
- *      bar draws a battery ICON, and an icon cannot answer the question a user
- *      actually asks ("how much is left?").  The icon is left alone - it still
- *      carries the charging/level shape, and one of those is worth keeping - and
- *      the digits are drawn next to it.
+ * WHAT WAS HERE, AND WHY IT IS NOT
+ * --------------------------------
+ * A battery percentage was drawn in the status bar beside the framework's battery icon, and a
+ * volume ring was driven from a periodic tick added to LvglDisplay.  Both worked on the bench
+ * for a while and then the device began panicking inside LVGL's own layout passes, in two
+ * different places from one firmware image:
  *
- *      With no data yet (the first ADC reading takes about a second, and a unit
- *      whose ADC fails never produces one) the label reads "--%" rather than a
- *      made-up 0% or 100%.
+ *     lv_font_get_glyph_dsc <- lv_label_event <- ... <- lv_display_refr_timer
+ *     get_prop_core (NULL style) <- calc_content_height <- ... <- lv_display_refr_timer
  *
- *   2. Nothing else.  The volume ring is NOT here: it lives in LvglDisplay, because
- *      every volume path in the firmware ends at AudioCodec::SetOutputVolume() and
- *      a per-board copy of the indicator would have to be repeated for every board
- *      that wants one.  See LvglDisplay::ShowVolumeOverlay().
+ * Three attempts to make it safe each traded one fault for another:
+ *
+ *   1. guarding the cached label pointer and recreating it -> still faulted
+ *   2. a SetTheme() override that called UpdateBatteryStatus() -> RECURSED, because SetTheme()
+ *      runs on the app_main path (Application::Initialize -> UpdateStatusBar), so the device
+ *      hung until the task watchdog fired, with app_main never returning
+ *   3. the same override deleting the label with lv_obj_del() -> faulted inside LVGL's own
+ *      teardown (lv_event_mark_deleted <- lv_obj_destructor), because a theme swap is not a
+ *      place to add or remove objects
+ *
+ * The pattern: the additions reached into LVGL from OUTSIDE the LVGL task - the periodic tick
+ * runs on the esp_timer task and the theme swap runs on app_main - and DisplayLockGuard does
+ * not save that, because it is a NON-BLOCKING try-lock that silently gives up.  Work that
+ * touches LVGL on a timer has to be marshalled onto the LVGL task, not locked and hoped for.
+ *
+ * The full implementation is parked, unbuilt, in docs/parked/ (the .volume-ui files).  It is a
+ * starting point for whoever picks this up, not something to restore as-is.
+ *
+ * WHAT REMAINS
+ * ------------
+ * The battery gauge itself (b220_battery.cc) is untouched and still running: plain ADC plus a
+ * discharge table, no LVGL objects, feeding Board::GetBatteryLevel() so the framework's own
+ * battery icon still reflects the charge.
  */
 
 #ifndef B220_LCD_DISPLAY_H
@@ -32,28 +52,6 @@ public:
                    bool swap_xy)
         : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y,
                         swap_xy) {}
-
-    /**
-     * Draw the battery percentage, next to the framework's battery icon.
-     *
-     * Called by the base class both from UpdateStatusBar() and from the display's
-     * own 1 Hz tick, so the number stays current even when no application event
-     * happens for minutes.  The label is created on the first call, i.e. after
-     * SetupUI() has built the status bar.
-     */
-    void UpdateBatteryStatus() override;
-
-private:
-    lv_obj_t* battery_percent_label_ = nullptr;
-    /* The last string actually drawn, so the once-a-second refresh does not touch
-     * LVGL (and therefore does not invalidate the status bar) when nothing moved.
-     * The level changes at most a few times an hour.
-     *
-     * 12 bytes, not 5: the compiler refuses a "%d%%" snprintf into a smaller buffer
-     * (an int could in principle be 11 digits plus the sign), and being right about
-     * that is cheaper than arguing with -Werror=format-truncation.  The value itself
-     * is clamped to 0..100 by the gauge. */
-    char battery_percent_text_[12] = {0};
 };
 
 #endif  // B220_LCD_DISPLAY_H

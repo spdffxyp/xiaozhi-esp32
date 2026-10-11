@@ -10,6 +10,7 @@
 #include "b220_lcd_display.h"
 #include "b220_battery.h"
 #include "application.h"
+#include "assets/lang_config.h"   /* the volume notification text */
 #include "button.h"
 #include "b220_baseboard_probe.h"
 #if B220_BUTTON_DISCOVERY
@@ -3032,6 +3033,28 @@ static void B220_ButtonSetVolume(bool up, bool jump) {
     ESP_LOGI(TAG, "key %s (%s): volume %d -> %d",
              up ? "VOLUME_UP" : "VOLUME_DOWN", jump ? "double press" : "single press",
              before, volume);
+
+    /*
+     * SHOW IT, USING THE FRAMEWORK'S OWN NOTIFICATION.
+     *
+     * Display::ShowNotification() is what nearly every board in this repository calls from
+     * its volume keys - it takes the display lock, sets the notification label and lets the
+     * existing notification timer take it away again.  Nothing new is created here, which
+     * matters: an earlier attempt at a volume indicator added a periodic timer and its own
+     * LVGL objects on top of the display class, and crashed the device inside LVGL's layout
+     * passes (see b220_lcd_display.h).  This is the supported path instead.
+     *
+     * The value is 0..100 (B220_BUTTON_VOLUME_MIN/MAX in config.h), so it is shown as a
+     * percentage, and at the top of the range the firmware says so in words - the same
+     * two-message pattern the other boards use.
+     */
+    if (auto* display = Board::GetInstance().GetDisplay(); display != nullptr) {
+        if (volume >= B220_BUTTON_VOLUME_MAX) {
+            display->ShowNotification(Lang::Strings::MAX_VOLUME);
+        } else {
+            display->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume) + "%");
+        }
+    }
 }
 
 /*

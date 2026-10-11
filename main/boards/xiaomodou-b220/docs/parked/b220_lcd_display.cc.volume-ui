@@ -1,0 +1,166 @@
+/*
+ * b220_lcd_display.cc - see b220_lcd_display.h for what this adds and why.
+ */
+
+#include "b220_lcd_display.h"
+
+#include "b220_battery.h"
+
+#include "lvgl_theme.h" /* LvglTheme, for the font applied after a theme change */
+
+#include <lvgl.h>
+
+#include <cstdio>
+#include <cstring>
+
+static const char* TAG = "b220-lcd";
+
+/*
+ * Shown until the first accepted ADC reading (about a second after boot), and for
+ * good on a unit whose ADC never produces one.  Deliberately not "0%" and not
+ * "100%": both are claims about the battery, and this label is supposed to say
+ * "no reading" instead.
+ */
+#define B220_BATTERY_UNKNOWN_TEXT "--%"
+
+/*
+ * How far left of the status bar's right edge the percentage is parked.
+ *
+ * The status bar is a full-width, transparent overlay on top of the top bar, and
+ * the two share the same corner: the framework's battery icon (and the mute icon)
+ * sit at the right end of the TOP bar.  So "right edge of the status bar" and "the
+ * battery icon" are the same place, and a label drawn there would cover the icon.
+ *
+ * This offset puts the digits immediately to the LEFT of that icon instead, so both
+ * stay readable: the icon keeps carrying the level shape (and is where a charging
+ * bolt would appear once the charge-detect line is identified), the digits carry the
+ * number.  24 px is about one icon-font line (the font is 20 px) plus the
+ * framework's own 2 px spacing between the two icons.
+ */
+#define B220_BATTERY_PERCENT_OFFSET_X (-24)
+
+void B220LcdDisplay::UpdateBatteryStatus() {
+    /*
+     * Create the label on first use rather than in a SetupUI() override: the base
+     * class owns SetupUI(), and its two variants (WeChat style / plain) build
+     * different widget trees.  By the time this runs, status_bar_ exists in both,
+     * and hanging the label off the status bar means it does not take part in the
+     * top bar's space-between row - the row is already full (network icon on the
+     * left, mute + battery icons on the right) and an extra flex child there would
+     * push the icons off a 160 px screen.
+     */
+    /*
+     * A THEME REFRESH DELETES THIS LABEL.
+     *
+     * "Refreshing display theme..." calls SetupUI() again, which rebuilds the whole widget
+     * tree - the old status bar and everything hanging off it included.  A cached child
+     * pointer then points at freed memory, and the next call to lv_label_set_text() walks
+     * that corpse during layout and faults:
+     *
+     *     Guru Meditation Error: Core 1 panic'ed (LoadProhibited)
+     *       lv_obj_get_display <- update_layout_completed_cb <- lv_label_event
+     *
+     * which is exactly what the bench saw: the device drew the percentage, refreshed the
+     * theme a second later, and rebooted in a loop.  So the pointer is re-validated before
+     * every use, and a label that no longer belongs to the current status bar is recreated
+     * rather than written to.
+     *
+     * lv_obj_is_valid() is safe on a stale pointer: it searches the live object tree, it does
+     * not dereference the pointer itself.
+     */
+    if (battery_percent_label_ != nullptr &&
+        !(lv_obj_is_valid(battery_percent_label_) &&
+          lv_obj_get_parent(battery_percent_label_) == status_bar_)) {
+        battery_percent_label_ = nullptr; /* the theme rebuild took it with the old screen */
+    }
+
+    if (battery_percent_label_ == nullptr) {
+        if (status_bar_ == nullptr) {
+            /* UpdateStatusBar() ran before SetupUI(): nothing to attach to yet, and
+             * the next tick will find the bar there. */
+            return;
+        }
+        battery_percent_label_ = lv_label_create(status_bar_);
+        /* Ask LVGL to null this pointer if the label is ever deleted (the screen is rebuilt
+         * on a theme change), so the cache cannot outlive the object. */
+        lv_obj_null_on_delete(&battery_percent_label_);
+        ApplyThemeFont();
+        lv_label_set_text(battery_percent_label_, B220_BATTERY_UNKNOWN_TEXT);
+        lv_obj_set_style_text_align(battery_percent_label_, LV_TEXT_ALIGN_RIGHT, 0);
+        /* Absolutely positioned, so the bar's own layout (which centres the clock
+         * and the notification on top of it) is not disturbed.  IGNORE_LAYOUT says
+         * the same thing to LVGL explicitly, in case the bar ever gains a real
+         * layout: this label must never push the clock off-centre. */
+        lv_obj_add_flag(battery_percent_label_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_align(battery_percent_label_, LV_ALIGN_TOP_RIGHT, B220_BATTERY_PERCENT_OFFSET_X, 0);
+        ESP_LOGI(TAG, "battery percentage label added to the status bar");
+    }
+
+    b220_battery_state_t state = {};
+    b220_battery_get_state(&state);
+
+    /* be print-safe for any int the API could ever return - "%d%%" of a
+     * full-range int is 12 bytes, and the compiler enforces that - while the
+     * displayed value is the clamped 0..100 the gauge publishes. */
+    char text[sizeof(battery_percent_text_)];
+    if (state.ready && state.percent >= 0) {
+        snprintf(text, sizeof(text), "%d%%", state.percent);
+    } else {
+        snprintf(text, sizeof(text), "%s", B220_BATTERY_UNKNOWN_TEXT);
+    }
+
+    if (strcmp(text, battery_percent_text_) == 0) {
+        return; /* nothing changed: do not touch LVGL, do not redraw the bar */
+    }
+    snprintf(battery_percent_text_, sizeof(battery_percent_text_), "%s", text);
+    lv_label_set_text(battery_percent_label_, text);
+}
+
+void B220LcdDisplay::SetTheme(Theme* theme) {
+    /*
+     * THE THEME SWAP IS NOT A PLACE TO TOUCH LVGL.  This override exists only to forget the
+     * cached label; it deliberately does not delete it and does not create a replacement.
+     *
+     * Two faults were made here before it came to that, both reported from the bench:
+     *
+     *  1. The label survived the swap with a font the new theme had replaced, and the next
+     *     layout pass read a glyph through the dead font:
+     *       lv_font_get_glyph_dsc <- lv_label_event <- ... <- lv_display_refr_timer
+     *
+     *  2. Calling UpdateBatteryStatus() at the end of this function recursed -
+     *     app_main -> Application::Initialize -> UpdateStatusBar -> UpdateBatteryStatus ->
+     *     lv_label_set_text -> lv_obj_invalidate - spun until IDLE0 starved and left the
+     *     device stuck on the volume screen.
+     *
+     *  3. Deleting the label here faults inside LVGL's own teardown:
+     *       lv_event_mark_deleted <- lv_obj_destructor <- lv_obj_delete
+     *     because this runs in the middle of the theme swap, with the event chain part way
+     *     through being rebuilt.
+     *
+     * So: drop the POINTER, keep the object.  The label is a child of the status bar and goes
+     * away with it when the old screen is destroyed; the cache is also registered with
+     * lv_obj_null_on_delete() where the label is created, so it cannot go stale either way.
+     * UpdateBatteryStatus() rebuilds it on the next tick, on the now-current theme, with its
+     * font applied explicitly.
+     */
+    if (battery_percent_label_ != nullptr) {
+        battery_percent_label_ = nullptr;
+        battery_percent_text_[0] = '\0';
+    }
+    SpiLcdDisplay::SetTheme(theme);
+}
+
+void B220LcdDisplay::ApplyThemeFont() {
+    if (battery_percent_label_ == nullptr || current_theme_ == nullptr) {
+        return;
+    }
+    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    /* text_font() hands back a shared_ptr, and holding it for the duration is what keeps the
+     * lv_font_t below alive while the style is set. */
+    auto font = lvgl_theme->text_font();
+    if (font == nullptr || font->font() == nullptr) {
+        return;
+    }
+    lv_obj_set_style_text_font(battery_percent_label_, font->font(), 0);
+    lv_obj_set_style_text_color(battery_percent_label_, lvgl_theme->text_color(), 0);
+}
