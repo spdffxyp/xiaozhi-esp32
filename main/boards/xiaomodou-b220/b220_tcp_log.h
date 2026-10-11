@@ -36,6 +36,11 @@
 
 #include <esp_err.h>
 
+/* The port the log listener uses.  Defined here rather than in the .cc so other modules
+ * can name it in their own messages (the baseboard link points at it when it has to tell
+ * the user how to get a readable console back). */
+#define B220_TCP_LOG_PORT_HINT 3333
+
 #ifdef __cplusplus
 extern "C" {
 #endif

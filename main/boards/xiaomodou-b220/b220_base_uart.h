@@ -60,6 +60,45 @@
 extern "C" {
 #endif
 
+/*
+ * Prove UART0 works without a baseboard attached: shorts TX to RX inside the chip,
+ * sends one frame, and checks it comes back.  Opt-in (B220_BASE_UART_SELFTEST) because
+ * it puts bytes on the wire that a real baseboard could mistake for a command.
+ *
+ * Returns ESP_ERR_INVALID_STATE when the input side is not readable - which is the
+ * console-owns-the-port build, where a loopback cannot be observed at all.
+ */
+esp_err_t b220_base_uart_selftest(void);
+
+/*
+ * Start a task that prints whatever the baseboard sends (b220_base_uart_read_pending()
+ * is otherwise never called, so "no reply" and "nobody looked" look identical) and that
+ * also serves the LOCAL TEST CHANNEL.  Does nothing when the input side is not readable.
+ *
+ * THE LOCAL TEST CHANNEL lets a serial or telnet console drive the baseboard without the
+ * cloud, which matters while the protocol's direction conventions are still unverified
+ * (one cloud round trip per attempt otherwise) and when the network is the thing that is
+ * broken.  Send one line:
+ *
+ *     {BASE+MOVE,forward,60,800}     drive; power and ms optional (default 40 and 800)
+ *     {BASE+STOP}                    stop now
+ *     {BASE+LIGHT,blue}              all lights one colour, or {BASE+LIGHT,off}
+ *     {BASE+HOLD,forward,60,5000}    ONE long frame, stopped after 5 s: separates "the
+ *                                    frame's length" from "the movement's length"
+ *     {BASE+SWEEP}                   walk the motion modes, steering angles and
+ *                                    durations by itself, logging each step - for
+ *                                    narrowing down 'nothing moves' without one
+ *                                    round trip per guess
+ *
+ * Commands go through b220_baseboard_*, so the caps, the heartbeat and the timeout still
+ * apply - the test channel drives the same code the assistant does, not a bypass.
+ */
+void b220_base_uart_start_rx_report(void);
+
+/* Parse one line of the local test channel.  Called by the RX task; exposed so it can be
+ * exercised from elsewhere without a UART. */
+void b220_base_uart_handle_test_command(const char* line);
+
 #define B220_BASE_UART_BAUD     115200
 #define B220_BASE_UART_TX_GPIO  1
 #define B220_BASE_UART_RX_GPIO  3

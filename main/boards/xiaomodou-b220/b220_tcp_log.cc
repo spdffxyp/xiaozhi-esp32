@@ -1,6 +1,14 @@
 /*
  * b220_tcp_log.cc - see b220_tcp_log.h.  A debug log channel over TCP so the serial
- * port can be handed to the baseboard.
+ * port can be handed to the baseboard - and, in the other direction, a COMMAND channel:
+ * every complete line an attached client sends is handed to the local test parser, so a
+ * telnet session is both the log and the console.
+ *
+ * That second direction exists because the first version of this was write-only, and the
+ * bench tried to drive the baseboard by typing {BASE+...} into telnet: the bytes arrived,
+ * were read, and thrown away (the reader only tested for "did the peer hang up").  A log
+ * channel that silently accepts input is worse than one that refuses it, so it now acts on
+ * what it is given.
  *
  * DESIGN NOTES THAT MATTER
  * ------------------------
@@ -39,41 +47,63 @@
 #include <lwip/sockets.h>
 #include <netinet/in.h>
 
+/*
+ * The local test parser lives with the UART link, because that is where the concept
+ * started.  The TCP log only borrows it: one parser means the two channels cannot drift
+ * apart in what they accept.
+ *
+ * This file still does NOT log anything itself - it is the log, and a message from inside
+ * it would re-enter the hook below.  Command acknowledgements therefore come from the
+ * parser's own logging, not from here.
+ */
+extern "C" void b220_base_uart_handle_test_command(const char* line);
+
 #define B220_TCP_LOG_PORT        3333
 /* The ring size is the amount of history a late client can see.  8 KB is several
  * hundred lines - more than a boot sequence - and irrelevant next to the ~90 KB of
  * free SRAM on this board. */
 #define B220_TCP_LOG_RING        8192
 /*
- * THE STACK BUDGET, WHICH IS THE WHOLE DESIGN CONSTRAINT HERE.
+ * THE STACK BUDGET, WHICH IS THE DESIGN CONSTRAINT HERE.
  *
  * The formatting buffer has to live on the CALLER's stack: esp_log's va_list is only
- * valid for the duration of the hook, so vsnprintf cannot be deferred.  And the caller
- * is often WiFi's event task, whose stack is
+ * valid for the duration of the hook, so vsnprintf cannot be deferred.  And the caller is
+ * often WiFi's event task, whose stack is CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE - 2304
+ * bytes when this module first appeared, with most of it already spoken for.
  *
- *     CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE = 2304 bytes
- *
- * with roughly 2000 of that already spoken for by the event dispatch and the WiFi event
- * handlers.  The first version of this file put 512 bytes there and the boot died with
+ * That is not theoretical.  With a 512-byte buffer and the stock 2304-byte event stack the
+ * boot died with
  *
  *     ***ERROR*** A stack overflow in task sys_evt has been detected.
  *
- * at "WiFi connecting to dlink" - a boot that had been fine before this module existed.
+ * at "WiFi connecting to dlink" - on a boot that had been fine before this module existed.
  *
- * So the buffer is sized from that budget rather than from "how long is the longest
- * line": 256 bytes leaves the event task ample room and still holds a normal line
- * whole.  A message longer than this is TRUNCATED AND MARKED, never silently cut, and
- * the lines that reach it are rare - the board's long diagnostics (the ZL38063
- * bring-up, which runs to ~470 bytes) are emitted from boot and audio tasks that have
- * kilobytes of headroom, so raising the limit for those would be paying stack in
- * sys_evt to serve a task that is not short of it.
+ * There were two ways out and this file takes the second:
  *
- * The measured lengths this is based on: of 368 lines in a reference boot, 296 are
- * under 128 bytes, 72 are longer, and only a handful exceed 256 - all of them from the
- * board's own bring-up logging.
+ *   1. keep the buffer small (256) and accept truncation.  It stopped the overflow but
+ *      cut real lines: a measured boot has 4 lines over 256 bytes (of 234) and they are
+ *      the board's own DSP bring-up diagnostics - the longest is 466 bytes and its TAIL is
+ *      the "per step: 1/5 upload=done, ... 5/5 soft reset=ok" summary, which is the part
+ *      actually worth reading.
+ *   2. size the buffer to what this firmware emits (512 covers every line) and PAY for it
+ *      where it is spent, by raising the event task's stack.  This board's config.json
+ *      sets CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE = 3584, i.e. 1.3 KB of heap, against a
+ *      fault that took the device down.
+ *
+ * Streaming a long line as several ring entries was also considered and rejected:
+ * vsnprintf has no "resume at offset" form, so it would have meant re-formatting the whole
+ * message for every chunk - wrong for a va_list and far more machinery than the problem
+ * deserves.
+ *
+ * The marker below is therefore a backstop, not the normal path: with the buffer at 512
+ * and the longest line at 466, nothing in a normal boot reaches it.
  */
-#define B220_TCP_LOG_CHUNK       256
-/* Longest single message accepted; longer ones are truncated and marked. */
+#define B220_TCP_LOG_CHUNK       512
+/* If a message still does not fit, its tail is replaced with this, so a partial line can
+ * never be mistaken for a whole one. */
+#define B220_TCP_LOG_CONT_MARK   "...[cut]"
+#define B220_TCP_LOG_CONT_LEN    (sizeof(B220_TCP_LOG_CONT_MARK) - 1)
+/* Longest single message accepted. */
 #define B220_TCP_LOG_MAX_MSG     2048
 
 #define B220_TCP_LOG_MAX_CLIENTS 4
@@ -197,10 +227,9 @@ private:
             /* Truncated: keep what fits, replace the tail with a marker so a partial
              * line cannot be mistaken for a whole one. */
             len = sizeof(buf) - 1;
-            static const char kMark[] = "...[cut]";
-            const size_t mark = sizeof(kMark) - 1;
-            if (len > mark) {
-                memcpy(&buf[len - mark], kMark, mark);
+            if (len > B220_TCP_LOG_CONT_LEN) {
+                memcpy(&buf[len - B220_TCP_LOG_CONT_LEN], B220_TCP_LOG_CONT_MARK,
+                       B220_TCP_LOG_CONT_LEN);
             }
         }
         if (len > B220_TCP_LOG_MAX_MSG) {
@@ -355,13 +384,55 @@ private:
                 if (FD_ISSET(listener, &read_fds)) {
                     accept_client(listener);
                 }
-                /* A readable client that we only stream TO means the peer closed or
-                 * sent something; either way it is not useful here, so drop it. */
+                /*
+                 * A readable client either hung up (drop it) or sent something, which on
+                 * this device is a COMMAND: the same {BASE+...} lines the serial test
+                 * channel accepts.  The line is accumulated per client, so a client that
+                 * types in pieces still gets its line parsed once.
+                 */
                 for (int i = 0; i < B220_TCP_LOG_MAX_CLIENTS; i++) {
-                    if (client_fd_[i] >= 0 && FD_ISSET(client_fd_[i], &read_fds)) {
-                        uint8_t scratch[32];
-                        if (recv(client_fd_[i], scratch, sizeof(scratch), MSG_DONTWAIT) <= 0) {
-                            drop_client(i);
+                    if (client_fd_[i] < 0 || !FD_ISSET(client_fd_[i], &read_fds)) {
+                        continue;
+                    }
+                    uint8_t chunk[64];
+                    const ssize_t got = recv(client_fd_[i], chunk, sizeof(chunk), MSG_DONTWAIT);
+                    if (got <= 0) {
+                        if (got < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+                            continue;   /* nothing to read after all */
+                        }
+                        drop_client(i);
+                        continue;
+                    }
+                    for (ssize_t b = 0; b < got; b++) {
+                        const char c = (char)chunk[b];
+                        if (c == '\r' || c == '\n' || c == '}') {
+                            if (c == '}') {
+                                /* Keep the brace: the UART parser expects it. */
+                                if (client_line_len_[i] < sizeof(client_line_[i]) - 1) {
+                                    client_line_[i][client_line_len_[i]++] = c;
+                                }
+                            }
+                            client_line_[i][client_line_len_[i]] = '\0';
+                            if (client_line_len_[i] > 0) {
+                                /*
+                                 * Hand it to the same parser the serial channel uses.
+                                 *
+                                 * DELIBERATELY NOT LOGGED HERE.  This file has no TAG and
+                                 * does not log at all: it IS the log, so a message from
+                                 * inside it would go through the hook that is calling this
+                                 * code.  The acknowledgement is the parser's own output
+                                 * ("test: MOVE ...", "SWEEP 1/8: ..."), which reaches the
+                                 * client through the normal stream a moment later.
+                                 */
+                                b220_base_uart_handle_test_command(client_line_[i]);
+                            }
+                            client_line_len_[i] = 0;
+                        } else if (client_line_len_[i] < sizeof(client_line_[i]) - 1) {
+                            client_line_[i][client_line_len_[i]++] = c;
+                        } else {
+                            /* Longer than any command: drop the partial line rather than
+                             * keep growing it. */
+                            client_line_len_[i] = 0;
                         }
                     }
                 }
@@ -420,7 +491,11 @@ private:
         client_count_++;
         /* One line the client sees immediately even when the device is idle, so
          * "connected but quiet" is distinguishable from "never connected". */
-        const char hello[] = "\r\n[tcplog] attached to the device log; buffered history follows\r\n";
+        const char hello[] =
+            "\r\n[tcplog] attached: buffered history follows.\r\n"
+            "[tcplog] You can also TYPE COMMANDS here, one per line:\r\n"
+            "[tcplog]   {BASE+MOVE,forward,100,3000}   {BASE+STOP}   {BASE+LIGHT,blue}\r\n"
+            "[tcplog]   {BASE+SWEEP}   (walks the motion parameters, logging each step)\r\n";
         (void)send(fd, hello, sizeof(hello) - 1, 0);
     }
 
@@ -486,6 +561,10 @@ private:
 
     int client_fd_[B220_TCP_LOG_MAX_CLIENTS] = {-1, -1, -1, -1};
     size_t read_pos_[B220_TCP_LOG_MAX_CLIENTS] = {};
+    /* One command line being typed per client.  96 bytes is well past the longest command
+     * this device accepts. */
+    char client_line_[B220_TCP_LOG_MAX_CLIENTS][96] = {};
+    size_t client_line_len_[B220_TCP_LOG_MAX_CLIENTS] = {};
     int client_count_ = 0;
 };
 

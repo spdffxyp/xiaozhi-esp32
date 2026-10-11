@@ -13,7 +13,9 @@
                 "CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y",
                 "CONFIG_USE_ESP_WAKE_WORD=y",
                 "CONFIG_WAKE_WORD_DISABLED=n",
-                "CONFIG_USE_AFE_WAKE_WORD=n"
+                "CONFIG_USE_AFE_WAKE_WORD=n",
+                "CONFIG_ESP_CONSOLE_NONE=y",
+                "CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3584"
             ]
         }
     ]
