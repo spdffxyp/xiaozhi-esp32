@@ -14,6 +14,7 @@
 #include "b220_tcp_log.h"   /* B220_TCP_LOG_PORT_HINT, named in the link-up log */
 
 #include "b220_baseboard.h"   /* the local test channel drives through the same guards */
+#include "b220_gsensor.h"     /* {BASE+ACCEL}, alongside the other read-only probes */
 
 #include "config.h"
 
@@ -1007,6 +1008,27 @@ void b220_base_uart_handle_test_command(const char* line)
         return;
     }
 
+    /*
+     * {BASE+ACCEL} - read the on-board accelerometer once and print it.
+     *
+     * Read-only and one transaction, which is the whole design of b220_gsensor: the chip
+     * shares I2C0 with the AW9106B (backlight and audio PA), so this reports what is there
+     * rather than starting a sampler.  At rest exactly one axis should sit near +-1000 mg;
+     * which axis that is says which way up the board is, and tilting the unit by hand says
+     * which axis is which.
+     */
+    if (strcmp(verb, "ACCEL") == 0) {
+        b220_gsensor_state_t state = {};
+        const esp_err_t err = b220_gsensor_read(&state);
+        char text[160];
+        b220_gsensor_describe(&state, text, sizeof(text));
+        ESP_LOGW(TAG, "test: ACCEL -> %s", text);
+        ESP_LOGW(TAG, "test: ACCEL -> WHO_AM_I 0x%02X (0x%02X expected for an SC7A20/LIS3DH)%s%s",
+                 state.who_am_i, 0x11, err == ESP_OK ? "" : " - error: ",
+                 err == ESP_OK ? "" : esp_err_to_name(err));
+        return;
+    }
+
     /* Ask the baseboard for its version. */
     if (strcmp(verb, "VER") == 0) {
         char rx[96];
@@ -1196,7 +1218,7 @@ void b220_base_uart_handle_test_command(const char* line)
     }
 
     ESP_LOGW(TAG, "test: unknown verb '%s' (RAW / MOVE / STOP / LIGHT / PING / VER / REF / "
-                  "HOLD / DIRS / SWEEP)", verb);
+                  "HOLD / DIRS / SWEEP / ACCEL)", verb);
 }
 
 void b220_base_uart_start_rx_report(void)

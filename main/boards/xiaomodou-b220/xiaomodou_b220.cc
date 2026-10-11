@@ -9,6 +9,7 @@
 #include "display/lcd_display.h"
 #include "b220_lcd_display.h"
 #include "b220_battery.h"
+#include "b220_gsensor.h"
 #include "application.h"
 #include "assets/lang_config.h"   /* the volume notification text */
 #include "button.h"
@@ -4435,8 +4436,44 @@ public:
                     return std::string("lights ") + color;
                 });
 
+            /*
+             * THE ACCELEROMETER, ON DEMAND.
+             *
+             * A tool rather than a background sampler on purpose: the chip shares I2C0 with
+             * the AW9106B, which owns the backlight and the audio PA's SHDN line, and nothing
+             * needs continuous motion yet (see b220_gsensor.h).  This reads when asked.
+             *
+             * The description tells the model, in as many words, that the orientation is the
+             * accelerometer's own axes and that which way the TOY faces has not been
+             * established - so it does not confidently announce "the device is tilted forward"
+             * on the strength of an axis nobody has verified.
+             */
+            mcp.AddTool(
+                "self.motion.get",
+                "Read the device's accelerometer (a 3-axis SC7A20H): acceleration on each axis "
+                "and which way the device is being held. Use it when the user asks whether the "
+                "device is level, which way it is leaning, or whether it has been moved.\n"
+                "Returns mg (milli-g) per axis: at rest one axis is about +-1000 and the other "
+                "two are near zero, and the reading names the orientation in plain words.\n"
+                "The axis-to-body mapping was measured on this hardware: Z is perpendicular to "
+                "the screen (positive with the screen up), X runs along the bottom edge, and Y "
+                "along the left edge. A reading whose largest axis is far from +-1000 mg means "
+                "the device was moving at that moment, not that it is tilted oddly.",
+                PropertyList(),
+                [](const PropertyList&) -> ToolResult {
+                    b220_gsensor_state_t state = {};
+                    const esp_err_t err = b220_gsensor_read(&state);
+                    if (err != ESP_OK) {
+                        return std::unexpected(std::string("no accelerometer reading: ") +
+                                               esp_err_to_name(err));
+                    }
+                    char text[160];
+                    b220_gsensor_describe(&state, text, sizeof(text));
+                    return std::string(text);
+                });
+
             ESP_LOGI(TAG, "board init: baseboard MCP tools registered (self.base.move / "
-                          "self.base.stop / self.base.lights)");
+                          "self.base.stop / self.base.lights) and self.motion.get");
         }
 
         ESP_LOGI(TAG, "board init complete: display, keys, indicator lights and the baseboard "
