@@ -211,22 +211,28 @@ esp_err_t b220_gsensor_init(void) {
 }
 
 /*
- * Which way is up, in words that mean something to someone holding the unit.
+ * Which way is up, in the words the owner of this toy uses: it is described like a figure lying
+ * down - which way its FACE points, and where its HEAD is - rather than in parts of the screen.
  *
  * THE AXIS MAPPING IS MEASURED, not taken from the chip's own axes.  A stationary unit was held
  * in each orientation and the dominant count landed within a few percent of the datasheet's 1024
  * every time:
  *
- *   screen up     -> z = +1000   |  screen down   -> z = -1000   => Z is normal to the screen
- *   rotated 90    -> x = +1000                                 => X runs along the bottom edge
- *   upright, level-> y = -1000                                 => Y runs along the left edge
+ *   screen up, flat -> z = +1000   => Z is normal to the screen (the face)
+ *   right edge low  -> y = -1000   => Y runs along the head-to-feet axis, head at +y
+ *   top edge low    -> x = +1000   => X runs across the body, +x towards the top edge
  *
- * SO THE SIGNS READ AS "that edge is UP", NOT "that edge is down": with Y along the left edge,
- * gravity pointing away from the left edge means the RIGHT edge is the low one, and that is the
- * y = -1000 case.  A first version of these strings said "right edge down (y down)" and was read,
- * quite reasonably, as a contradiction - the physical words and the axis sign disagreed.  The
- * axis sign is therefore left out; the physical description is the answer, and the raw numbers
- * are in the same line for anyone who wants to check it.
+ * SO THE SIGNS READ AS "that edge is UP", NOT "that edge is down".  With Y running from the feet
+ * up to the head, gravity pointing away from the head (y = -1000) means the HEAD is the high end.
+ * An earlier version of these strings said "right edge down (y down)", which contradicts itself
+ * when read literally, and a language model reading it duly reported the tilt backwards; the
+ * axis signs now stay in this comment and out of the sentence a model reads out.
+ *
+ * The face/head names for the two flat cases and for head-up were given by the owner and are the
+ * ones to keep.  The sideways cases are named after them by symmetry: with the face up the toy is
+ * lying on its back, face down means on its face, and standing on an edge means on its side -
+ * which would make "lying on its left side" the case where the left edge is the low one, and
+ * "head down" the opposite of the measured head-up case.
  */
 static const char* orientation_of(int mg_x, int mg_y, int mg_z) {
     const int ax = mg_x < 0 ? -mg_x : mg_x;
@@ -234,14 +240,19 @@ static const char* orientation_of(int mg_x, int mg_y, int mg_z) {
     const int az = mg_z < 0 ? -mg_z : mg_z;
 
     if (az >= ax && az >= ay) {
-        return mg_z > 0 ? "screen up, flat" : "screen down, flat";
+        return mg_z > 0 ? "face up" : "face down";
     }
     if (ax >= ay) {
-        /* X runs along the bottom edge, so +x means that edge is the high one. */
-        return mg_x > 0 ? "top edge down" : "bottom edge down";
+        /*
+         * X runs across the body, so +x means the top edge is the high one - which is the case
+         * measured on the bench, and the owner calls it "lying on its side".  The opposite sign
+         * is the other side, and WHICH SIDE is which has not been measured on this unit; the
+         * names only have to stay distinguishable until someone checks.
+         */
+        return mg_x > 0 ? "lying on its side" : "lying on its other side";
     }
-    /* Y runs along the left edge, so -y means the left edge is high: the right edge is down. */
-    return mg_y > 0 ? "left edge down" : "right edge down";
+    /* Y runs from the feet to the head, so -y means the head is the high end. */
+    return mg_y > 0 ? "head down" : "head up";
 }
 
 esp_err_t b220_gsensor_read(b220_gsensor_state_t* state) {

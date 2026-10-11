@@ -88,17 +88,32 @@ the datasheet's 1024 every time:
 
 | Unit held | Reading | Conclusion |
 | --- | --- | --- |
-| screen up, flat | z = **+1000 mg** | **Z is normal to the screen** |
+| screen up, flat | z = **+1000 mg** | **Z is normal to the screen** (the face) |
 | screen down | z = **-1000 mg** | (confirms the same axis) |
-| rotated 90 deg from upright | x = **+1000 mg** | **X runs along the bottom edge** |
-| right edge down | y = **-1000 mg** | **Y runs along the left edge** |
+| right edge low | y = **-1000 mg** | **Y runs along the head-to-feet axis, head at +y** |
+| rotated 90 deg from upright | x = **+1000 mg** | **X runs across the body, +x towards the top edge** |
 
-**Read the signs as "which edge is up", not "which edge is down".** With Y along the left edge,
-gravity pointing away from the left edge (`y = -1000`) means the **right** edge is the low one.
-The first version of the orientation strings said `right edge down (y down)`, which contradicts
-itself when read literally, and a language model reading it duly reported the tilt backwards. The
-strings now state the physical orientation alone, and the raw numbers travel in the same line for
-anyone who wants to check the sign themselves.
+**Read the signs as "which edge is UP", not "which edge is down".** For Y, gravity pointing away
+from the head (`y = -1000`) means the **head** is the high end. An earlier version of the
+orientation strings said `right edge down (y down)`, which contradicts itself when read literally,
+and a language model reading it duly reported the tilt backwards. The axis signs now stay in the
+driver's comment and out of the sentence a model reads out.
+
+### The words used for the orientations
+
+The owner of the toy describes it like a figure lying down, and those are the strings the driver
+returns (and that the MCP tool description tells the model to report verbatim):
+
+| Reading | String |
+| --- | --- |
+| z high (either sign) | `face up` / `face down` |
+| y high (either sign) | `head up` / `head down` |
+| x high (either sign) | `lying on its side` / `lying on its other side` |
+
+`face up`, `face down`, `head up` and `lying on its side` are the owner's terms, each matched to a
+measured reading. The remaining four are named by symmetry and **which physical side is "its
+side" versus "its other side" has not been measured** - the two only have to stay distinguishable
+until someone confirms them.
 
 Note also that the offsets are small but real, and discarded by the 12-bit shift: the axes that
 should read zero come back at roughly 80-130 counts (about 0.1 g) - consistent with the

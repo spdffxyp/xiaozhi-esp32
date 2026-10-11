@@ -4451,14 +4451,16 @@ public:
             mcp.AddTool(
                 "self.motion.get",
                 "Read the device's accelerometer (a 3-axis SC7A20H): acceleration on each axis "
-                "and which way the device is being held. Use it when the user asks whether the "
-                "device is level, which way it is leaning, or whether it has been moved.\n"
+                "and which way the device is being held. Use it when the user asks which way up "
+                "it is, whether it is level, or whether it has been moved.\n"
                 "Returns mg (milli-g) per axis: at rest one axis is about +-1000 and the other "
                 "two are near zero, and the reading names the orientation in plain words.\n"
-                "The axis-to-body mapping was measured on this hardware: Z is perpendicular to "
-                "the screen (positive with the screen up), X runs along the bottom edge, and Y "
-                "along the left edge. A reading whose largest axis is far from +-1000 mg means "
-                "the device was moving at that moment, not that it is tilted oddly.",
+                "The orientation is described the way the owner of this toy describes it, as a "
+                "figure lying down: face up / face down is which way the screen points, head up "
+                "/ head down is which end is higher, and lying on its side is the in-between "
+                "cases. Report that wording rather than translating it into screen directions.\n"
+                "A reading whose largest axis is far from +-1000 mg means the device was moving "
+                "at that moment, not that it is tilted oddly.",
                 PropertyList(),
                 [](const PropertyList&) -> ToolResult {
                     b220_gsensor_state_t state = {};
