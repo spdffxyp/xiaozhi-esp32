@@ -425,6 +425,25 @@ DSP（`HBI 0x0238/0x023A`）的正是这个函数。
 所以本板只需要实现**寄存器换算**：`B220_Backlight::SetBrightnessImpl()` 把 0..100 映射到
 `0x23/0x24` 的 0..255（四舍五入），走 AW9106B 设备句柄。
 
+### ✅ 最终验收（2026-10-11 08:36，`logs/boot-20261011-083618.log`）
+
+```
+52: backlight: applying the saved brightness 100%          <- 走"存过"分支
+53: backlight 100% -> DIM3/DIM4 (reg 0x23/0x24) = 0xFF      <- 满亮度，无缓动
+（`Set brightness to 75` 与 `backlight 99%/98%/…` 的缓动行：0 条）
+
+124: AudioCodec: Set output volume to 70
+125: ZL38063: volume 70 -> gain 0xEC (-20 dB)               <- 保存值真的进了 DSP
+```
+
+| 功能 | 状态 |
+| --- | --- |
+| 背光默认 100% | ✅ 上机 |
+| 背光亮度持久化（改→重启→恢复） | ✅ 上机 |
+| 音量持久化**并生效** | ✅ 上机（修复前只"看起来"持久化） |
+
+---
+
 ### ★★ 上机又抓到一个：两个默认值打架，屏幕被"拉下去"
 
 第一版（已提交为 `7b554cf`）上机日志：
