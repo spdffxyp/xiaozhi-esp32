@@ -7,6 +7,8 @@
  */
 #include "zl38063_audio_codec.h"
 #include "display/lcd_display.h"
+#include "b220_lcd_display.h"
+#include "b220_battery.h"
 #include "application.h"
 #include "button.h"
 #include "b220_baseboard_probe.h"
@@ -3395,7 +3397,13 @@ protected:
 
 class XiaoMoDouB220Board : public WifiBoard {
 private:
-    LcdDisplay* display_ = nullptr;
+    /*
+     * B220LcdDisplay, not the framework's plain SpiLcdDisplay: this board's screen
+     * shows the battery as a percentage (see b220_lcd_display.h).  The volume ring
+     * needs no board subclass - it is in LvglDisplay and therefore already present
+     * here.
+     */
+    B220LcdDisplay* display_ = nullptr;
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
 
 protected:
@@ -3704,10 +3712,10 @@ protected:
         vTaskDelay(pdMS_TO_TICKS(5000));  // let a human read the card
 #endif
 
-        display_ = new SpiLcdDisplay(panel_io, panel,
-                                     DISPLAY_WIDTH, DISPLAY_HEIGHT,
-                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
-                                     DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new B220LcdDisplay(panel_io, panel,
+                                      DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
+                                      DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
 #if B220_AUDIO_BRINGUP
@@ -4162,6 +4170,16 @@ public:
         static_cast<B220_Backlight*>(GetBacklight())->ApplySavedBrightnessNow();
         InitializeSpi();
         InitializeLcdDisplay();
+        /*
+         * The battery gauge (GPIO36 / ADC1_CH0, see b220_battery.h).  Started here,
+         * right after the screen, because the only consumer is the status bar: the
+         * first reading lands about a second later, and the label shows "--%" until
+         * then.  A failure is logged and nothing else happens - a missing battery
+         * reading must never keep the device from booting.
+         */
+        if (b220_battery_start() != ESP_OK) {
+            ESP_LOGW(TAG, "battery gauge unavailable - the status bar will show --%%");
+        }
         InitializeButtons();
 #if B220_AUDIO_BRINGUP
         InitializeAudioDsp();
@@ -4440,6 +4458,34 @@ public:
 
     virtual Display* GetDisplay() override {
         return display_;
+    }
+
+    /*
+     * The battery is a plain ADC channel on this board (b220_battery.cc).  With
+     * this returning true, the framework's status bar shows its level icon and
+     * B220LcdDisplay adds the percentage beside it.
+     *
+     * The return value is the capability flag of the interface: `false` means "this
+     * device cannot tell you", and the status bar then leaves the battery out
+     * entirely.  It is therefore only true once a reading has actually been
+     * accepted - on a unit whose ADC never answers, the screen stays clean instead
+     * of showing a permanent guess.
+     *
+     * `charging` is always false: this port has not identified the stock firmware's
+     * charge-detect line (config.h), and claiming a charge would put a charging bolt
+     * on a battery that is draining.  `discharging` is its complement, which is also
+     * what the low-battery popup keys off.
+     */
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        b220_battery_state_t state = {};
+        b220_battery_get_state(&state);
+        if (!state.ready || state.percent < 0) {
+            return false;
+        }
+        level = state.percent;
+        charging = false;
+        discharging = true;
+        return true;
     }
 };
 

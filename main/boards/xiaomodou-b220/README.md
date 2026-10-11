@@ -178,7 +178,34 @@ python scripts/build.py xiaomodou-b220 --name xiaomodou-b220 --wake-word nihaoxi
 本板级在 `InitializeBacklight()` 里原样回放该序列（DIM3/DIM4 = 0x80 作指示灯）。
 （另：LEDC/PWM 在该固件里完全不存在，所以没有调光能力。）
 
-## 已知待测项
+## 电量显示与音量圆环（本轮新增，**未上机验证**）
+
+### 电池电量（右上角百分比）
+
+电池走 **ESP32 自己的 ADC**，不是电量计 IC，也没有基板上报：
+
+| 项 | 值 | 依据 |
+| --- | --- | --- |
+| 电池电压 | **GPIO36 / ADC1_CH0**、衰减 12 dB | 参考工程 `ref/Flower_modou` 的引脚表与 `components/modou_drivers/modou_battery.c`（原厂固件每秒读一次该通道） |
+| NTC | GPIO37 / ADC1_CH1 | 同上，但**本移植不读**（没有地方显示温度，不采无用数据） |
+| 换算 | `raw -> mV`：原厂常量；`mV -> %`：原厂 21 点放电表 | 逐条复刻原厂链路，不猜分压电阻 |
+| 采样 | 10 次、去最大最小取中间 8 平均、每秒一次 | 与原厂一致 |
+| 充电检测 | **无**——原厂充电检测脚未定位 | 因此永远报"未充电"，界面只有电量、没有充电闪电 |
+
+- 显示位置：状态栏（右上角）`NN%`，字号 20，与框架自带的电量图标并存。
+- **数据未就绪时显示 `--%`**（不显示假 0% / 100%）。开机约 1 秒后第一次采样。
+- `eFuse` 校准值只在 `B220_BATTERY_LOG_SAMPLES=1` 时打日志，用于以后判断原厂换算是否需要修正。
+
+### 音量圆环（居中浮层）
+
+- 音量变化时屏幕中央浮出**空心圆环 + 中心百分比数字**（整环 = 100%，顺时针增长），**2 秒后自动消失**。
+- 触发方式是 **看 codec 的 `output_volume()`**，不是绑按键：所以按键音量加减、云端 `self.audio_speaker.set_volume`
+  两条路径都会显示。
+- 实现在框架层（`main/display/lvgl_display/lvgl_display.cc`，`LvglDisplay::ShowVolumeOverlay()` /
+  `UpdateVolumeStatus` 周期 tick），不属于板级——其它板要用只接一个回调。
+- 圆环画在**独立 screen** 上（`lv_obj_create(nullptr)`），不碰应用界面、不吃点击事件。
+- 相关参数：`STATUS_TICK_MS`（100，检测周期）、`VOLUME_OSD_HOLD_MS`（2000，停留时长）。
+## 已知待测项（本轮新增两项见下）
 
 - **调优**：CPU `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240`、PSRAM `CONFIG_SPIRAM_SPEED_80M` 均已生效。
 - **SPI 时钟**：10 MHz 与原厂一致，稳定后可上调（LCD 与 DSP 在同一总线可各自设时钟）。
@@ -187,3 +214,6 @@ python scripts/build.py xiaomodou-b220 --name xiaomodou-b220 --wake-word nihaoxi
 - **原始 `draw_bitmap` 通路需要手动字节交换**：LVGL 那条路由 `SpiLcdDisplay` 的 `swap_bytes=1` 处理，
   但**裸 `esp_lcd_panel_draw_bitmap()` 的缓冲必须自己 `__builtin_bswap16()`**，否则红蓝互换。
   （自检用的方向测试卡就踩过这个坑，代码里已修正并注明；方向卡现在使用面板原生尺寸绘制。）
+- **电池电压百分比（本轮新增，未上机）**：引脚来自参考工程（GPIO36/ADC1_CH0），换算是原厂常量 + 原厂放电表。
+  上机后要对一次：记录 `raw` / mV / 百分比，并与万用表实测电池电压比对；若整段偏移，改的是换算而不是表。
+  顺带确认充电检测脚（原厂有"充电中/充满"状态线，本移植未接线，见 `config.h`）。

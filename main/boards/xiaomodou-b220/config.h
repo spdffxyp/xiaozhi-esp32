@@ -1100,4 +1100,49 @@
 /* How many consecutive arms may fail to move the device out of idle before the
  * driver stops for good (e.g. no audio channel and therefore no protocol). */
 #define B220_AUTO_LISTEN_MAX_MISSES 5
+/* ---------------------------------------------------------------- battery --
+ * The battery gauge is an ADC channel on the ESP32 itself, not a fuel-gauge IC:
+ *
+ *   GPIO36 = ADC1_CH0, the divided battery voltage (the stock firmware's "BAT"
+ *            input)
+ *   GPIO37 = ADC1_CH1, the NTC divider - read by the stock firmware but NOT by
+ *            this port; nothing displays a temperature yet, so the pin is left
+ *            alone rather than sampled and thrown away.
+ *
+ * Evidence: the stock firmware's power task reads ADC1 channel 0 every second and
+ * publishes a power state every ten reads, converting raw -> mV with its own
+ * constant and mV -> percent with a 21-point discharge table.  The independent
+ * open-source port of this same toy (ref/Flower_modou, README pin table, and
+ * components/modou_drivers/modou_battery.c) names the same two pins and
+ * reproduces both conversions, which is what b220_battery.cc implements.
+ *
+ * CONSEQUENCE FOR THE BUTTON PROBE: B220_BUTTON_DISCOVERY samples GPIO 20/36/39
+ * looking for the key lines.  GPIO36 is the battery input, so a discovery run
+ * would log it as a signal that never changes - it is not a key.  Harmless (the
+ * probe only reads, and an ADC input is high-impedance), but do not read a
+ * "GPIO36: no change" line as "the key is not there".
+ *
+ * NO CHARGING DETECT: the charge-insert / charge-done status lines of the stock
+ * firmware are not identified, so this port never claims the battery is charging
+ * - b220_battery.cc always reports "not charging" and the UI shows a level
+ * instead of a bolt.  Add the GPIO here once it is known and measured. */
+#define B220_BATTERY_ADC_GPIO       GPIO_NUM_36
+/* 11/12 dB attenuation: the ESP32's widest input range, and the one the stock
+ * firmware selects (atten enum 3).  The battery divider is scaled to fit it. */
+#define B220_BATTERY_ADC_ATTEN      ADC_ATTEN_DB_12
+/* Samples per reading: the stock firmware takes 10, sorts them, drops the highest
+ * and the lowest and averages the remaining 8 - a cheap way to survive the ADC
+ * noise an ESP32 sees while Wi-Fi and I2S are running.  Same filter here. */
+#define B220_BATTERY_SAMPLES        10
+#define B220_BATTERY_TRIMMED        8
+/* Gap between the samples of one reading, and the period between readings.  The
+ * stock firmware's own cadence is one reading per second. */
+#define B220_BATTERY_SAMPLE_GAP_US  800
+#define B220_BATTERY_PERIOD_MS      1000
+#define B220_BATTERY_TASK_STACK     3072
+
+/* Set to 1 to log every accepted reading (raw, mV, percent).  Off in production:
+ * one line per second would drown the log. */
+#define B220_BATTERY_LOG_SAMPLES    0
+
 #endif // _BOARD_CONFIG_H_

@@ -49,6 +49,19 @@ public:
     virtual void SetTheme(Theme* theme);
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
+    /// Refresh the battery indicator only (see LvglDisplay::UpdateBatteryStatus).
+    virtual void UpdateBatteryStatus() {}
+    /**
+     * Show the current volume as a hollow ring (the full ring is 100%).
+     *
+     * @param volume 0..100, clamped by the implementation.  A negative value hides
+     *               the ring at once.
+     *
+     * Implementations must be callable from any task.
+     */
+    virtual void ShowVolumeOverlay(int volume) { (void)volume; }
+    /// Hide the volume ring immediately.
+    virtual void HideVolumeOverlay() {}
     virtual void SetPowerSaveMode(bool on);
     virtual bool AddTextGlyphs(const std::vector<TextGlyph>& glyphs, uint8_t bpp) { return false; }
     virtual void ClearTextGlyphs() {}
