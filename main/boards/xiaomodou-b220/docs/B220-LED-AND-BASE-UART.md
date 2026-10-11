@@ -402,6 +402,51 @@ rst:0xc (SW_CPU_RESET)
 
 ---
 
+## 2.9a-pre0 亮度与音量的持久化（2026-10-11）
+
+用户要求："修改声音和背光亮度后保存到 flash，下次启动加载。"
+
+### 音量：**框架本来就在存，但从来没被应用**（真 bug）
+
+`AudioCodec::Start()` 只做一件事：把 `Settings("audio"/"output_volume")` 读进
+`output_volume_`。它**不调用 `SetOutputVolume()`** —— 而在这台机器上，真正把电平写进
+DSP（`HBI 0x0238/0x023A`）的正是这个函数。
+
+后果很隐蔽：**UI 和 NVS 里的音量被恢复了，喇叭的实际电平却是 boot 配置记录里那个固定值。**
+看起来"设置是持久的"，实际每次开机音量都不一样（跟上次调过什么无关）。
+
+修法：`Zl38063AudioCodec::Start()` 在 `AudioCodec::Start()` 之后调用
+`SetOutputVolume(output_volume())` —— **必须调重写版**，因为写 DSP 的是它。
+
+### 背光：实现框架的 `Backlight` 接口，而不是自建 NVS
+
+框架已经有完整的持久化：`Backlight::SetBrightness(pct, permanent=true)` 写
+`Settings("display"/"brightness")`，`Backlight::RestoreBrightness()` 读回（0..100，默认 75）。
+所以本板只需要实现**寄存器换算**：`B220_Backlight::SetBrightnessImpl()` 把 0..100 映射到
+`0x23/0x24` 的 0..255（四舍五入），走 AW9106B 设备句柄。
+
+### ★ 这里又踩了一次同一类陷阱
+
+我先把 `SetBrightness()` 写成派生类的 `override` —— **编译直接报错**：
+`Backlight::SetBrightness()` **不是虚函数**，`RestoreBrightness()` 内部调用它永远是基类版本。
+（和前面 `WifiBoard::OnNetworkEvent` 完全同一类问题：**非虚函数 + 基类内部调用 = 派生版本永不执行**。
+两次都是靠"加 override 让编译器报错"或"加日志发现没打印"才发现的。）
+
+改法：**在开局时预置 `brightness_` 到目标值**，让基类的 `SetBrightness()` 命中
+`brightness_ == brightness` 的提前返回 —— **缓动定时器根本不会启动**。
+
+**为什么必须避免那个缓动**：`Backlight::SetBrightness()` 只存目标值，真正的写入发生在 5 ms
+定时器里、**从当前值逐级**进行。开机时当前值是 **0**，于是"恢复保存亮度"会先往 `0x23` 写一百个
+近黑值 —— 而**低值是实测会关掉这块屏的**。用户会看到每次开机屏幕先黑、再慢慢爬亮，还要多花
+两百次 I2C 写。**缓动适合"用户主动改亮度"，不适合"开机恢复设置"。**
+
+### 背光默认值改为 100%
+
+实测 `0xFF`（100%）最亮且无异常，所以出厂默认改为满亮度。用户在系统里改过之后，
+NVS 里的值才是准；`config.h` 的 `B220_LED_BACKLIGHT_DEFAULT_PERCENT` 只是**首次开机的默认**。
+
+---
+
 ## 2.9a-pre2 ✅ 灯光策略上机验证通过（2026-10-11 08:07，`logs/boot-20261011-080701.log`）
 
 ### 策略（用户确认的最终版）

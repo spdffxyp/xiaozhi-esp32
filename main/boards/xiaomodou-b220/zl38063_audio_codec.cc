@@ -139,6 +139,23 @@ void Zl38063AudioCodec::Start() {
     /* The base class reads the persisted volume and logs "Audio codec started". */
     AudioCodec::Start();
     ReportBringupOnce();
+
+    /*
+     * APPLY the persisted volume, which the base class only LOADS.
+     *
+     * AudioCodec::Start() reads Settings("audio"/"output_volume") into
+     * output_volume_, and that is all it does - it does not call SetOutputVolume(),
+     * so on this board the DSP's gain registers kept whatever the boot config record
+     * wrote (the volume-70 equivalent).  The user's saved level was therefore
+     * "restored" in the UI and in NVS while the speaker came up at a different
+     * level every boot: the setting looked persistent and was not.
+     *
+     * Calling the override (not the base) is the point: the override is what writes
+     * HBI 0x0238/0x023A.  It re-persists the same value, which is harmless and keeps
+     * one code path for "volume changed".
+     */
+    SetOutputVolume(output_volume());
+
     ESP_LOGI(TAG, "ZL38063 codec started: %d Hz / %d-bit / %d slot(s); the DSP "
                   "application and its config record were brought up by the board "
                   "at boot, this class only moves PCM over I2S0",

@@ -292,13 +292,22 @@
 #define B220_LED_INDICATOR_IDLE_LEVEL 0x00   /* dark while idle (power saving) */
 
 /*
- * LCD backlight ceiling, 0..255.  Measured 2026-10-10: the panel is brighter at
- * every step up to 0xFF, so 0xFF is the hardware maximum.  The port still uses
- * 0x80 at boot because that is the factory value and raising it costs current and
- * panel heat; change this AND the {0x23, ...}/{0x24, ...} entries in
- * InitializeBacklight() together if a brighter panel is wanted.
+ * LCD backlight, in the framework's 0..100 percent units (not raw register
+ * values).  The panel is on AW9106B DIM3/DIM4 (reg 0x23/0x24), which take 0..255;
+ * B220_Backlight in xiaomodou_b220.cc converts and writes them.
+ *
+ * Measured 2026-10-10: the panel is brighter at every value up to 0xFF, i.e. the
+ * backlight uses the same 8-bit range as the RGB channels, so 0xFF (100%) is the
+ * hardware maximum - hence a default of full brightness.
+ *
+ * These are DEFAULTS ONLY, used the first time the device boots.  Afterwards the
+ * user's choice lives in NVS under "display"/"brightness" (the framework's
+ * Backlight base class owns that key, plus the fade and the clamp to 0..100), and
+ * the board restores it at start-up.  To change the out-of-box default, change
+ * this number; to change what a device does today, that is a setting, not a build.
  */
-#define B220_LED_BACKLIGHT_MAX 0xFF
+#define B220_LED_BACKLIGHT_DEFAULT_PERCENT 100
+#define B220_LED_BACKLIGHT_MAX_PERCENT     100
 
 /* ONE-SHOT BENCH MEASUREMENT, off in production: with this set to 1, the boot
  * ramps the LCD backlight through 0x3F/0x80/0xBF/0xE0/0xFF (3 s each) and logs

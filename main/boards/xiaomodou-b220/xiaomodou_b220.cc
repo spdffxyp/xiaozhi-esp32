@@ -16,6 +16,7 @@
 #include "b220_buttons.h"
 #endif
 #include "b220_led.h"
+#include "settings.h"
 #include "b220_led_policy.h"
 #include "b220_base_uart.h"
 /*
@@ -3309,12 +3310,99 @@ static void ProbeAw9106() {
 }
 #endif  // B220_DIAGNOSTIC
 
+/*
+ * The LCD backlight, as the framework's Backlight interface wants it.
+ *
+ * The panel's light is AW9106B DIM3/DIM4 (registers 0x23/0x24) - measured, and the
+ * reason b220_led.c never drives those two.  Implementing this interface rather
+ * than inventing a settings layer is what makes the brightness both adjustable AND
+ * persistent: Backlight::SetBrightness(percent, permanent=true) writes
+ * "display"/"brightness" to NVS, and Backlight::RestoreBrightness() reads it back,
+ * so the board's only job is the register conversion.
+ *
+ * Percent (0..100) -> DIMx (0..255), rounded so that 50% is 128 rather than 127.
+ * Nothing is written when the AW9106B never came up: the panel is dark either way
+ * and a failing I2C write on every brightness change would only add noise.
+ */
+class B220_Backlight : public Backlight {
+public:
+    B220_Backlight() = default;
+
+protected:
+    /*
+     * Apply a brightness at START-UP without the fade, then leave the fade alone.
+     *
+     * Why this cannot simply override SetBrightness(): that method is NOT virtual
+     * (backlight.h), so RestoreBrightness() calling it internally always reaches the
+     * base version and a derived-class copy would never run - the same trap as
+     * WifiBoard::OnNetworkEvent earlier in this port.  What works instead is to look
+     * the saved value up here, write the hardware once, and then let
+     * RestoreBrightness() do its thing: because brightness_ is primed to the same
+     * value, Backlight::SetBrightness() takes its `brightness_ == brightness` early
+     * return, so no fade timer is started at all.
+     *
+     * Why that matters: the fade ramps from the CURRENT value one step per 5 ms, and
+     * at boot the current value is 0.  Restoring without this would write a hundred
+     * near-black values to DIM3/DIM4 - and a low value there is measured to switch
+     * this panel OFF - so the screen would go dark and crawl back up on every boot.
+     * A fade is right for a change the user makes; it is wrong for a restore.
+     *
+     * The same NVS key the base class uses ("display"/"brightness", 0..100) is read
+     * and written here, so the two agree and there is no second source of truth.
+     */
+public:
+    void ApplySavedBrightnessNow() {
+        Settings settings("display", false);
+        int percent = settings.GetInt("brightness", B220_LED_BACKLIGHT_DEFAULT_PERCENT);
+        if (percent < 0) {
+            percent = 0;
+        }
+        if (percent > B220_LED_BACKLIGHT_MAX_PERCENT) {
+            percent = B220_LED_BACKLIGHT_MAX_PERCENT;
+        }
+        brightness_ = (uint8_t)percent;
+        target_brightness_ = brightness_;
+        SetBrightnessImpl(brightness_);
+        ESP_LOGI(TAG, "backlight: applied the saved brightness %d%% at start-up (no fade; "
+                      "fades are for changes the user makes later)",
+                 (int)brightness_);
+    }
+
+    void SetBrightnessImpl(uint8_t brightness) override {
+        if (s_board_aw9106_dev == nullptr) {
+            ESP_LOGW(TAG, "backlight %u%%: the AW9106B is not attached, nothing written",
+                     (unsigned)brightness);
+            return;
+        }
+        const uint8_t dim = (uint8_t)(((uint16_t)brightness * 255u + 50u) / 100u);
+        const uint8_t regs[2] = {0x23, 0x24};   /* DIM3 / DIM4 = the panel light */
+        for (int i = 0; i < 2; i++) {
+            const uint8_t b[2] = {regs[i], dim};
+            const esp_err_t err = i2c_master_transmit(s_board_aw9106_dev, b, sizeof(b), 100);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "backlight %u%% (DIM=0x%02X): reg 0x%02X write failed (%s)",
+                         (unsigned)brightness, (unsigned)dim, (unsigned)regs[i],
+                         esp_err_to_name(err));
+                return;
+            }
+        }
+        ESP_LOGI(TAG, "backlight %u%% -> AW9106B DIM3/DIM4 (reg 0x23/0x24) = 0x%02X",
+                 (unsigned)brightness, (unsigned)dim);
+    }
+};
+
 class XiaoMoDouB220Board : public WifiBoard {
 private:
     LcdDisplay* display_ = nullptr;
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
 
 protected:
+    /*
+     * The board's backlight object.  Created lazily by GetBacklight() so that the
+     * Backlight base constructor (which creates a fade timer) runs inside a normal
+     * task, not during the board's static construction.
+     */
+    B220_Backlight* backlight_ = nullptr;
 
     /*
      * The panel backlight is NOT a GPIO on this board: the stock firmware never
@@ -4041,8 +4129,33 @@ protected:
     }
 
 public:
+    /*
+     * Handed to Application for the display-brightness APIs and the MCP tool.
+     * Created on first use, and the saved brightness is restored by the constructor
+     * below (not here), so that the restore happens after the AW9106B is attached.
+     */
+    Backlight* GetBacklight() override {
+        if (backlight_ == nullptr) {
+            backlight_ = new B220_Backlight();
+        }
+        return backlight_;
+    }
+
     XiaoMoDouB220Board() {
         InitializeBacklight();
+        /*
+         * Apply the user's saved brightness.  This has to be AFTER
+         * InitializeBacklight(): it writes AW9106B reg 0x23/0x24 and needs the device
+         * handle created there.  ApplySavedBrightnessNow() writes the hardware once
+         * and primes the base class; the RestoreBrightness() call right after is then
+         * a no-op (see B220_Backlight) which keeps the base class's own default path
+         * intact for anything that calls it later.  The init sequence above still
+         * parks the panel at a known-good value first, so a settings read that fails
+         * can never leave the screen dark.
+         */
+        auto* bl = static_cast<B220_Backlight*>(GetBacklight());
+        bl->ApplySavedBrightnessNow();
+        bl->RestoreBrightness();
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeButtons();
