@@ -18,6 +18,11 @@
 #include "b220_led.h"
 #include "settings.h"
 #include "b220_led_policy.h"
+
+#include "mcp_server.h"   /* self.base.* tools */
+#include "b220_baseboard.h"
+
+#include <cstdlib>   /* strtod, for the seconds argument */
 #include "b220_tcp_log.h"
 #include "b220_base_uart.h"
 /*
@@ -4265,6 +4270,17 @@ public:
          * frames are sent on demand through b220_base_uart.h.
          */
         ESP_LOGI(TAG, "board init: starting the baseboard handshake");
+#if B220_BASE_UART_SELFTEST
+        /* Bench check: proves UART0 itself works, baseboard or not.  See config.h. */
+        (void)b220_base_uart_selftest();
+#endif
+#if B220_BASE_UART_RX_REPORT
+        /* Print whatever the baseboard says, so "no reply" is a fact rather than an
+         * assumption. */
+        b220_base_uart_start_rx_report();
+#endif
+        /* Motors and lights: limits, heartbeat and the timeout guard live in there. */
+        (void)b220_baseboard_start();
         {
             const esp_err_t base_err = b220_base_uart_start_handshake();
             if (base_err != ESP_OK) {
@@ -4291,6 +4307,95 @@ public:
                 ESP_LOGW(TAG, "board init: the RGB light policy did not start (%s)",
                          esp_err_to_name(pol_err));
             }
+        }
+
+        /*
+         * THE BASEBOARD'S ENTRY POINTS.
+         *
+         * Until these existed, b220_base_motion()/stop()/lights() had no callers at all -
+         * the motors and lights could not be commanded by anything.  Exposing them as MCP
+         * tools is what lets a spoken request reach them ("往前走一点", "停", "把灯变蓝"),
+         * and it is the layer that fits this device: the assistant is the interface.
+         *
+         * The tools are thin on purpose.  The limits, the heartbeat that keeps a move
+         * smooth and the timeout that stops the wheels if anything goes wrong all live in
+         * b220_baseboard.c, so they apply no matter who calls it - including a future
+         * button mapping - and cannot be forgotten at one call site.
+         */
+        {
+            auto& mcp = McpServer::GetInstance();
+            mcp.AddTool(
+                "self.base.move",
+                "Drive the toy's base. Use it when the user asks the device to go "
+                "somewhere, turn, or back up.\n"
+                "Args:\n"
+                "  `direction`: \"forward\" or \"backward\" to drive; \"left\" or \"right\"\n"
+                "    to turn while moving (an arc); \"spin_left\" or \"spin_right\" to turn\n"
+                "    ON THE SPOT - use these only when the user says to turn in place,\n"
+                "    otherwise prefer left/right.\n"
+                "  `power`: the drive speed, 10 to 255. Omit for 255 (full).\n"
+                "    raise it when the movement needs to be quicker.\n"
+                "  `seconds`: how long to drive, 0.2 to 10.0. Omit for 2.0.\n"
+                "The device stops by itself when the time is up, so prefer short moves and "
+                "repeat them rather than asking for one long one.",
+                PropertyList({Property("direction", kPropertyTypeString),
+                              Property("power", kPropertyTypeInteger, 255, 10, 255),
+                              Property("seconds", kPropertyTypeString, "2.0")}),
+                [](const PropertyList& properties) -> ToolResult {
+                    const std::string direction = properties["direction"].value<std::string>();
+                    const int power = properties["power"].value<int>();
+                    /* seconds arrives as a string so "0.8" is expressible; the Property
+                     * class only has integer support. */
+                    double seconds = 2.0;
+                    const std::string secs = properties["seconds"].value<std::string>();
+                    if (!secs.empty()) {
+                        seconds = strtod(secs.c_str(), nullptr);
+                    }
+                    int ms = (int)(seconds * 1000.0);
+                    const esp_err_t err = b220_baseboard_move(direction.c_str(), power, ms);
+                    if (err != ESP_OK) {
+                        return std::unexpected(std::string("move failed: ") +
+                                               esp_err_to_name(err));
+                    }
+                    return std::string("driving ") + direction + " at " + std::to_string(power) +
+                           "% for " + std::to_string(ms) + " ms";
+                });
+
+            mcp.AddTool(
+                "self.base.stop",
+                "Stop the toy's base immediately. Use it whenever the user says stop, and "
+                "when a move should not continue.",
+                PropertyList(),
+                [](const PropertyList&) -> ToolResult {
+                    const esp_err_t err = b220_baseboard_stop();
+                    if (err != ESP_OK) {
+                        return std::unexpected(std::string("stop failed: ") +
+                                               esp_err_to_name(err));
+                    }
+                    return std::string("stopped");
+                });
+
+            mcp.AddTool(
+                "self.base.lights",
+                "Set the base's lights. The FRONT lights are RGB and take a colour; the "
+                "REAR light is a single red LED and only understands red or off, so it is "
+                "controlled separately - the lights stay on until changed.\n"
+                "Args:\n"
+                "  `color`: \"white\", \"red\", \"yellow\", \"green\", \"blue\", "
+                "\"deepblue\", \"purple\" for the front; \"rear_red\" for the rear; "
+                "\"front_off\" / \"rear_off\" to switch one group off; \"off\" for both.",
+                PropertyList({Property("color", kPropertyTypeString)}),
+                [](const PropertyList& properties) -> ToolResult {
+                    const std::string color = properties["color"].value<std::string>();
+                    const esp_err_t err = b220_baseboard_lights(color.c_str());
+                    if (err != ESP_OK) {
+                        return std::unexpected("unknown colour: " + color);
+                    }
+                    return std::string("lights ") + color;
+                });
+
+            ESP_LOGI(TAG, "board init: baseboard MCP tools registered (self.base.move / "
+                          "self.base.stop / self.base.lights)");
         }
 
         ESP_LOGI(TAG, "board init complete: display, keys, indicator lights and the baseboard "

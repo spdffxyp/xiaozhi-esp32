@@ -326,6 +326,25 @@
  * port: the network is the convenient channel, not a dependable one, and "the network
  * will not come up" is exactly the kind of fault worth being able to see.  Set to 0 to
  * give the key back its single meaning. */
+/*
+ * Baseboard diagnostics.  The baseboard shares UART0 with what used to be the console,
+ * so "the baseboard is not answering" and "the UART is not working" look identical
+ * unless something checks.  These two do:
+ *
+ *   SELFTEST  shorts TX to RX INSIDE the chip (uart_set_loop_back), sends one frame and
+ *             checks it comes back.  It proves the driver, the rings, the clock divider
+ *             and the pin mux without any baseboard at all - which is the difference
+ *             between "nobody answered" and "this port was never going to work".
+ *             Off by default: it puts bytes on the wire a real baseboard could read as a
+ *             command.  Turn it on for a bench check, look at one boot, turn it off.
+ *
+ *   RX_REPORT prints everything the baseboard sends.  Without it nothing ever calls the
+ *             read path, so a silent baseboard and a baseboard nobody listened to are
+ *             indistinguishable.  Leave it on.
+ */
+#define B220_BASE_UART_SELFTEST 0
+#define B220_BASE_UART_RX_REPORT 1
+
 #define B220_TCP_LOG_DUMP_ON_VOLUME_DOWN 1
 
 #define B220_LED_WALK 0
