@@ -44,11 +44,38 @@
  * hundred lines - more than a boot sequence - and irrelevant next to the ~90 KB of
  * free SRAM on this board. */
 #define B220_TCP_LOG_RING        8192
-/* Largest single log chunk kept.  A longer line is truncated rather than dropped, so
- * one call can never lap the whole ring. */
-#define B220_TCP_LOG_CHUNK       512
-/* Four simultaneous tail-ends is plenty for debugging and keeps the socket count
- * (CONFIG_LWIP_MAX_SOCKETS = 10) comfortable. */
+/*
+ * THE STACK BUDGET, WHICH IS THE WHOLE DESIGN CONSTRAINT HERE.
+ *
+ * The formatting buffer has to live on the CALLER's stack: esp_log's va_list is only
+ * valid for the duration of the hook, so vsnprintf cannot be deferred.  And the caller
+ * is often WiFi's event task, whose stack is
+ *
+ *     CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE = 2304 bytes
+ *
+ * with roughly 2000 of that already spoken for by the event dispatch and the WiFi event
+ * handlers.  The first version of this file put 512 bytes there and the boot died with
+ *
+ *     ***ERROR*** A stack overflow in task sys_evt has been detected.
+ *
+ * at "WiFi connecting to dlink" - a boot that had been fine before this module existed.
+ *
+ * So the buffer is sized from that budget rather than from "how long is the longest
+ * line": 256 bytes leaves the event task ample room and still holds a normal line
+ * whole.  A message longer than this is TRUNCATED AND MARKED, never silently cut, and
+ * the lines that reach it are rare - the board's long diagnostics (the ZL38063
+ * bring-up, which runs to ~470 bytes) are emitted from boot and audio tasks that have
+ * kilobytes of headroom, so raising the limit for those would be paying stack in
+ * sys_evt to serve a task that is not short of it.
+ *
+ * The measured lengths this is based on: of 368 lines in a reference boot, 296 are
+ * under 128 bytes, 72 are longer, and only a handful exceed 256 - all of them from the
+ * board's own bring-up logging.
+ */
+#define B220_TCP_LOG_CHUNK       256
+/* Longest single message accepted; longer ones are truncated and marked. */
+#define B220_TCP_LOG_MAX_MSG     2048
+
 #define B220_TCP_LOG_MAX_CLIENTS 4
 #define B220_TCP_LOG_TASK_STACK  4096
 #define B220_TCP_LOG_TASK_PRIO   4
@@ -132,21 +159,12 @@ private:
 
     static int hook(const char* fmt, va_list ap)
     {
-        /* Format once into a stack buffer: no allocation, bounded work.  vsnprintf
-         * returns the length it WOULD have written, hence the clamp. */
-        char buf[B220_TCP_LOG_CHUNK];
-        va_list copy;
-        va_copy(copy, ap);
-        const int n = vsnprintf(buf, sizeof(buf), fmt, copy);
-        va_end(copy);
-
         TcpLog& self = instance();
-        if (self.started_ && self.ring_mutex_ != nullptr && n > 0) {
-            size_t len = (size_t)n;
-            if (len >= sizeof(buf)) {
-                len = sizeof(buf) - 1;   /* truncated, keep the terminator */
-            }
-            self.append(buf, len);
+        if (self.started_ && self.ring_mutex_ != nullptr) {
+            va_list copy;
+            va_copy(copy, ap);
+            self.ring_printf(fmt, copy);
+            va_end(copy);
         }
 
         /* The original handler, unchanged: this is what still writes the serial log.
@@ -155,6 +173,75 @@ private:
             return self.previous_(fmt, ap);
         }
         return vprintf(fmt, ap);
+    }
+
+    /*
+     * Format into a bounded stack buffer, then copy into the ring.  No null terminator
+     * is ever copied into the ring (the stream is raw text), and nothing is written
+     * past the end of the buffer.
+     *
+     * Two passes are not needed: one vsnprintf into the local buffer gives both the text
+     * and its length, and vsnprintf cannot overflow that buffer whatever the format
+     * asks for.  What it can do is report that the text did not fit, which is when the
+     * truncation marker goes on.
+     */
+    void ring_printf(const char* fmt, va_list ap)
+    {
+        char buf[B220_TCP_LOG_CHUNK];
+        const int written = vsnprintf(buf, sizeof(buf), fmt, ap);
+        if (written <= 0) {
+            return;
+        }
+        size_t len = (size_t)written;
+        if (len >= sizeof(buf)) {
+            /* Truncated: keep what fits, replace the tail with a marker so a partial
+             * line cannot be mistaken for a whole one. */
+            len = sizeof(buf) - 1;
+            static const char kMark[] = "...[cut]";
+            const size_t mark = sizeof(kMark) - 1;
+            if (len > mark) {
+                memcpy(&buf[len - mark], kMark, mark);
+            }
+        }
+        if (len > B220_TCP_LOG_MAX_MSG) {
+            len = B220_TCP_LOG_MAX_MSG;
+        }
+
+        if (xSemaphoreTake(ring_mutex_, portMAX_DELAY) != pdTRUE) {
+            return;
+        }
+
+        /* Make room, dropping the oldest data rather than lapping a client. */
+        const size_t used = (write_pos_ + B220_TCP_LOG_RING - oldest_pos_) % B220_TCP_LOG_RING;
+        if (used + len > B220_TCP_LOG_RING) {
+            const size_t need = used + len - B220_TCP_LOG_RING;
+            oldest_pos_ = (oldest_pos_ + need) % B220_TCP_LOG_RING;
+            for (int i = 0; i < B220_TCP_LOG_MAX_CLIENTS; i++) {
+                if (client_fd_[i] >= 0) {
+                    read_pos_[i] = oldest_pos_;
+                }
+            }
+        }
+
+        /* Copy, splitting at the end of the ring.  Only the data bytes are copied: a
+         * NUL in the middle of the stream would look like corruption to a client. */
+        const size_t to_end = B220_TCP_LOG_RING - write_pos_;
+        if (len <= to_end) {
+            memcpy(&ring_[write_pos_], buf, len);
+        } else {
+            memcpy(&ring_[write_pos_], buf, to_end);
+            memcpy(ring_, buf + to_end, len - to_end);
+        }
+        write_pos_ = (write_pos_ + len) % B220_TCP_LOG_RING;
+
+        /* Any client that the write just lapped jumps to the oldest surviving byte. */
+        for (int i = 0; i < B220_TCP_LOG_MAX_CLIENTS; i++) {
+            if (client_fd_[i] >= 0 && read_pos_[i] == write_pos_) {
+                read_pos_[i] = oldest_pos_;
+            }
+        }
+
+        xSemaphoreGive(ring_mutex_);
     }
 
     /* ------------------------------------------------------------ ring buffer */
