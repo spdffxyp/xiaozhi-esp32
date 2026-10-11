@@ -83,13 +83,26 @@ writes (`0x08`) is used, and **sample coherency is not attempted through that bi
 
 ## Which way is up: the axis mapping, measured
 
-Three stationary readings, each with the dominant count within a few percent of 1024:
+The unit was held still in each orientation and the dominant count landed within a few percent of
+the datasheet's 1024 every time:
 
 | Unit held | Reading | Conclusion |
 | --- | --- | --- |
-| screen down | z = **-1000 mg** | **Z is normal to the screen**; +z with the screen up |
+| screen up, flat | z = **+1000 mg** | **Z is normal to the screen** |
+| screen down | z = **-1000 mg** | (confirms the same axis) |
 | rotated 90 deg from upright | x = **+1000 mg** | **X runs along the bottom edge** |
-| upright and level | x, z near 0, y = -1000 mg | **Y runs along the left edge** |
+| right edge down | y = **-1000 mg** | **Y runs along the left edge** |
+
+**Read the signs as "which edge is up", not "which edge is down".** With Y along the left edge,
+gravity pointing away from the left edge (`y = -1000`) means the **right** edge is the low one.
+The first version of the orientation strings said `right edge down (y down)`, which contradicts
+itself when read literally, and a language model reading it duly reported the tilt backwards. The
+strings now state the physical orientation alone, and the raw numbers travel in the same line for
+anyone who wants to check the sign themselves.
+
+Note also that the offsets are small but real, and discarded by the 12-bit shift: the axes that
+should read zero come back at roughly 80-130 counts (about 0.1 g) - consistent with the
+datasheet's offset specification of +-90 mg after soldering.
 
 ## What this part offers that is not used yet
 

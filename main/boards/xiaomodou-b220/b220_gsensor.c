@@ -213,16 +213,20 @@ esp_err_t b220_gsensor_init(void) {
 /*
  * Which way is up, in words that mean something to someone holding the unit.
  *
- * THE AXIS MAPPING IS MEASURED, not taken from the chip's own axes.  Three bench readings of a
- * stationary unit, each with the dominant count landing within a few percent of the datasheet's
- * 1024-per-g, fixed it:
+ * THE AXIS MAPPING IS MEASURED, not taken from the chip's own axes.  A stationary unit was held
+ * in each orientation and the dominant count landed within a few percent of the datasheet's 1024
+ * every time:
  *
- *   z = -1000 mg with the screen down, and z = +1000 with it up  -> Z is normal to the screen
- *   x = +1000 mg after rotating the upright unit                 -> X runs along the bottom edge
- *   x and z both near zero with the unit upright and level       -> Y runs along the left edge
+ *   screen up     -> z = +1000   |  screen down   -> z = -1000   => Z is normal to the screen
+ *   rotated 90    -> x = +1000                                 => X runs along the bottom edge
+ *   upright, level-> y = -1000                                 => Y runs along the left edge
  *
- * The strings keep the axis name as well as the physical description, so a reading can still be
- * checked against the raw numbers when the mounting is ever changed.
+ * SO THE SIGNS READ AS "that edge is UP", NOT "that edge is down": with Y along the left edge,
+ * gravity pointing away from the left edge means the RIGHT edge is the low one, and that is the
+ * y = -1000 case.  A first version of these strings said "right edge down (y down)" and was read,
+ * quite reasonably, as a contradiction - the physical words and the axis sign disagreed.  The
+ * axis sign is therefore left out; the physical description is the answer, and the raw numbers
+ * are in the same line for anyone who wants to check it.
  */
 static const char* orientation_of(int mg_x, int mg_y, int mg_z) {
     const int ax = mg_x < 0 ? -mg_x : mg_x;
@@ -230,12 +234,14 @@ static const char* orientation_of(int mg_x, int mg_y, int mg_z) {
     const int az = mg_z < 0 ? -mg_z : mg_z;
 
     if (az >= ax && az >= ay) {
-        return mg_z > 0 ? "screen up, flat (z up)" : "screen down, flat (z down)";
+        return mg_z > 0 ? "screen up, flat" : "screen down, flat";
     }
     if (ax >= ay) {
-        return mg_x > 0 ? "bottom edge down (x up)" : "top edge down (x down)";
+        /* X runs along the bottom edge, so +x means that edge is the high one. */
+        return mg_x > 0 ? "top edge down" : "bottom edge down";
     }
-    return mg_y > 0 ? "left edge down (y up)" : "right edge down (y down)";
+    /* Y runs along the left edge, so -y means the left edge is high: the right edge is down. */
+    return mg_y > 0 ? "left edge down" : "right edge down";
 }
 
 esp_err_t b220_gsensor_read(b220_gsensor_state_t* state) {
