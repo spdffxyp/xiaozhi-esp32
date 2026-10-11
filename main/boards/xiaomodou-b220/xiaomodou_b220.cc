@@ -3330,44 +3330,59 @@ public:
 
 protected:
     /*
-     * Apply a brightness at START-UP without the fade, then leave the fade alone.
+     * Apply the saved brightness at START-UP, directly, and make sure the base
+     * class does not then override it with its own default.
      *
-     * Why this cannot simply override SetBrightness(): that method is NOT virtual
-     * (backlight.h), so RestoreBrightness() calling it internally always reaches the
-     * base version and a derived-class copy would never run - the same trap as
-     * WifiBoard::OnNetworkEvent earlier in this port.  What works instead is to look
-     * the saved value up here, write the hardware once, and then let
-     * RestoreBrightness() do its thing: because brightness_ is primed to the same
-     * value, Backlight::SetBrightness() takes its `brightness_ == brightness` early
-     * return, so no fade timer is started at all.
+     * Two separate problems are solved here, and the first version of this code
+     * only solved one of them (measured: the panel came up at 100% and was then
+     * visibly dragged down to 75%, one step per 5 ms):
      *
-     * Why that matters: the fade ramps from the CURRENT value one step per 5 ms, and
-     * at boot the current value is 0.  Restoring without this would write a hundred
-     * near-black values to DIM3/DIM4 - and a low value there is measured to switch
-     * this panel OFF - so the screen would go dark and crawl back up on every boot.
-     * A fade is right for a change the user makes; it is wrong for a restore.
+     * 1. NO FADE AT START-UP.  Backlight::SetBrightness() only stores a TARGET and
+     *    the register writes happen one step per 5 ms from the CURRENT value, which
+     *    at boot is 0.  Restoring through it would push a hundred near-black values
+     *    into DIM3/DIM4 - and a low value there is measured to switch this panel OFF
+     *    - so the screen would go dark and crawl back up on every boot.  Writing the
+     *    hardware once and priming brightness_ makes RestoreBrightness() take the
+     *    base class's "value unchanged" early return, so no timer starts at all.  A
+     *    fade is right for a change the user makes; it is wrong for a restore.
      *
-     * The same NVS key the base class uses ("display"/"brightness", 0..100) is read
-     * and written here, so the two agree and there is no second source of truth.
+     * 2. WHICH DEFAULT WINS.  The base class's RestoreBrightness() falls back to 75%
+     *    when nothing is stored - so on a device that has never had its brightness
+     *    changed, its default fought this board's (B220_LED_BACKLIGHT_DEFAULT_
+     *    PERCENT, 100%): the board applied 100%, then the base class read "nothing
+     *    stored -> 75" and faded down to it.  The fix is to persist this board's
+     *    default once, so that from then on "nothing stored" cannot happen.
+     *
+     * Settings has no "does this key exist" call, hence the sentinel: a value that is
+     * not a valid percentage can only mean "never stored".  (Erasing the key later,
+     * e.g. a factory reset, brings the board default back rather than 75%.)
      */
+    static constexpr int kNeverStored = -1;
+
 public:
     void ApplySavedBrightnessNow() {
-        Settings settings("display", false);
-        int percent = settings.GetInt("brightness", B220_LED_BACKLIGHT_DEFAULT_PERCENT);
-        if (percent < 0) {
-            percent = 0;
+        Settings settings("display", true);   /* read_write: the persist below needs it */
+        const int stored = settings.GetInt("brightness", kNeverStored);
+
+        int percent;
+        if (stored == kNeverStored || stored < 0 || stored > B220_LED_BACKLIGHT_MAX_PERCENT) {
+            percent = B220_LED_BACKLIGHT_DEFAULT_PERCENT;
+            settings.SetInt("brightness", percent);
+            ESP_LOGI(TAG, "backlight: no saved brightness (or an invalid one: %d) - applying this "
+                          "board's default %d%% and storing it",
+                     stored, percent);
+        } else {
+            percent = stored;
+            ESP_LOGI(TAG, "backlight: applying the saved brightness %d%%", percent);
         }
-        if (percent > B220_LED_BACKLIGHT_MAX_PERCENT) {
-            percent = B220_LED_BACKLIGHT_MAX_PERCENT;
-        }
+
         brightness_ = (uint8_t)percent;
         target_brightness_ = brightness_;
+        step_ = 1;
         SetBrightnessImpl(brightness_);
-        ESP_LOGI(TAG, "backlight: applied the saved brightness %d%% at start-up (no fade; "
-                      "fades are for changes the user makes later)",
-                 (int)brightness_);
     }
 
+protected:
     void SetBrightnessImpl(uint8_t brightness) override {
         if (s_board_aw9106_dev == nullptr) {
             ESP_LOGW(TAG, "backlight %u%%: the AW9106B is not attached, nothing written",
@@ -4144,18 +4159,20 @@ public:
     XiaoMoDouB220Board() {
         InitializeBacklight();
         /*
-         * Apply the user's saved brightness.  This has to be AFTER
+         * Apply the user's saved brightness.  It has to be AFTER
          * InitializeBacklight(): it writes AW9106B reg 0x23/0x24 and needs the device
-         * handle created there.  ApplySavedBrightnessNow() writes the hardware once
-         * and primes the base class; the RestoreBrightness() call right after is then
-         * a no-op (see B220_Backlight) which keeps the base class's own default path
-         * intact for anything that calls it later.  The init sequence above still
-         * parks the panel at a known-good value first, so a settings read that fails
-         * can never leave the screen dark.
+         * handle created there.
+         *
+         * ApplySavedBrightnessNow() does the whole job - read NVS, fall back to this
+         * board's default and STORE it, then write the hardware once and prime the
+         * base class's state - which is why Backlight::RestoreBrightness() is NOT
+         * called here.  Calling it was the bug the bench caught: it reads the same
+         * key but falls back to its own 75% default, so it silently pulled the panel
+         * down from this board's 100% with a visible fade.  The init sequence above
+         * still parks the panel at a known-good value first, so a settings read that
+         * fails can never leave the screen dark.
          */
-        auto* bl = static_cast<B220_Backlight*>(GetBacklight());
-        bl->ApplySavedBrightnessNow();
-        bl->RestoreBrightness();
+        static_cast<B220_Backlight*>(GetBacklight())->ApplySavedBrightnessNow();
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeButtons();

@@ -425,6 +425,50 @@ DSP（`HBI 0x0238/0x023A`）的正是这个函数。
 所以本板只需要实现**寄存器换算**：`B220_Backlight::SetBrightnessImpl()` 把 0..100 映射到
 `0x23/0x24` 的 0..255（四舍五入），走 AW9106B 设备句柄。
 
+### ★★ 上机又抓到一个：两个默认值打架，屏幕被"拉下去"
+
+第一版（已提交为 `7b554cf`）上机日志：
+
+```
+52: backlight 100% -> DIM3/DIM4 = 0xFF                    <- 我们的代码应用了板级默认 100%
+53: backlight: applied the saved brightness 100% at start-up (no fade)
+54: Backlight: Set brightness to 75                        <- 基类随后把它拉回它自己的默认值
+56: backlight 99% -> DIM3/DIM4 = 0xFC                     <- 并且开始缓动下降，一路到 75%
+```
+
+**根因**：`Backlight::RestoreBrightness()` 自己也会读同一个 NVS 键，而它的兜底默认是 **75**。
+用户从没存过亮度 ⇒ 它走兜底 ⇒ **把板级的 100% 覆盖掉，还带一次可见的缓动**。
+
+**这属于"我调用了两次恢复"** —— 我在 `ApplySavedBrightnessNow()` 之后又调了基类的
+`RestoreBrightness()`，以为它是"同步基类状态"的无害操作，实际它是**第二次恢复**，
+而且用的是另一个默认值。
+
+**修法**：只由板级方法负责恢复；并且用**哨兵默认值**区分"从没存过"和"存过"：
+
+```cpp
+static constexpr int kNeverStored = -1;                   // Settings 没有"键是否存在"接口
+const int stored = settings.GetInt("brightness", kNeverStored);
+if (stored 无效) { percent = 板级默认; settings.SetInt("brightness", percent); }  // 落盘一次
+else            { percent = stored; }
+```
+
+之后"没存过"这种状态就不存在了，基类再也无法用它的 75% 覆盖。同时**不再调用
+`Backlight::RestoreBrightness()`**（注释里写明了原因，避免以后有人"顺手加回来"）。
+
+> **教训：同一个设置不要接两套恢复逻辑。** 两处默认值（板级 100% / 框架 75%）
+> 必然打架，而且症状是"屏幕亮度不对"这种看起来像硬件问题的现象。
+
+### 音量那条修复，上机确认有效
+
+```
+I (6483) AudioCodec: Audio codec started
+I (6483) AudioCodec: Set output volume to 40         <- 保存值从 NVS 读出
+I (6483) ZL38063: volume 40 -> gain 0xCE (-50 dB)    <- 真的写进了 DSP
+I (6493) Zl38063AudioCodec: SetOutputVolume(40): stored AND applied to the DSP
+```
+
+修复前这里只有第一行 —— NVS 里有值、UI 显示正确，而喇叭电平是 boot 配置记录的固定值。
+
 ### ★ 这里又踩了一次同一类陷阱
 
 我先把 `SetBrightness()` 写成派生类的 `override` —— **编译直接报错**：
