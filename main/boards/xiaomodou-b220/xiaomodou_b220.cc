@@ -18,6 +18,7 @@
 #include "b220_led.h"
 #include "settings.h"
 #include "b220_led_policy.h"
+#include "b220_tcp_log.h"
 #include "b220_base_uart.h"
 /*
  * config.h must come BEFORE zl38063_dsp.h: zl38063_dsp.h exposes the
@@ -3062,6 +3063,19 @@ static void B220_KeyFeedback(b220_button_action_t action) {
         break;
     case B220_BTN_ACTION_VOLUME_DOWN:
         (void)b220_led_pulse(B220_LED_RED, 120, B220_LED_OFF);
+        /*
+         * THE FALLBACK FOR THE FALLBACK.  The log is readable over TCP on port 3333,
+         * which is how it will be read once the baseboard covers the serial connector
+         * - but that needs a working network, and "the network will not come up" is
+         * itself one of the things worth debugging.  So a volume-down press also dumps
+         * the recent log to the SERIAL port (see b220_tcp_log.h).  It is a deliberate
+         * second job for a key that already has one: a debug aid must not depend on
+         * the thing being debugged.  Set B220_TCP_LOG_DUMP_ON_VOLUME_DOWN to 0 in
+         * config.h to retire it.
+         */
+#if B220_TCP_LOG_DUMP_ON_VOLUME_DOWN
+        b220_tcp_log_dump();
+#endif
         break;
     default:
         (void)b220_led_pulse(B220_LED_BLUE, 120, B220_LED_OFF);

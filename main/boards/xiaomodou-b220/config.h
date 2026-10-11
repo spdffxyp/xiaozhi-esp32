@@ -316,6 +316,18 @@
  * backlight uses the same 8-bit DIM range as the RGB channels (datasheet 9.2).
  * The port still PARKS it at 0x80 - the factory value - because raising it is a
  * power/heat decision, not a correctness one (see B220_LED_BACKLIGHT_MAX below). */
+/* The debug log is available over TCP (port 3333) as well as on the serial port, so
+ * the serial connector can be handed to the baseboard once it is plugged in - the
+ * baseboard covers that connector, and the port is also what makes baseboard REPLIES
+ * unreadable while the console owns it.  b220_tcp_log.cc installs the hook before
+ * app_main(), so the buffered stream contains the whole boot.
+ *
+ * With this set to 1, a volume-down press also dumps the recent log to the SERIAL
+ * port: the network is the convenient channel, not a dependable one, and "the network
+ * will not come up" is exactly the kind of fault worth being able to see.  Set to 0 to
+ * give the key back its single meaning. */
+#define B220_TCP_LOG_DUMP_ON_VOLUME_DOWN 1
+
 #define B220_LED_WALK 0
 
 /* TEMPORARY bring-up diagnostic: print the FreeRTOS task list (name/state/priority/

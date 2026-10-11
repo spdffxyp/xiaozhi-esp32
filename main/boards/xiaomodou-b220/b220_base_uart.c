@@ -18,6 +18,7 @@
 
 #include <driver/uart.h>
 #include <esp_log.h>
+#include <esp_rom_serial_output.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -30,11 +31,75 @@ static const char* TAG = "b220-base";
 #define B220_BASE_FRAME_MAX      192
 #define B220_BASE_LAST_MAX       160
 
+/*
+ * HOW THE FRAME IS PUT ON THE WIRE, AND WHY NOT THROUGH THE UART DRIVER
+ * --------------------------------------------------------------------
+ * The baseboard shares UART0 with the console, and on ESP-IDF 6.1 the console
+ * claims that port in a way that leaves no room for a second user:
+ *
+ *     esp_driver_uart/src/uart_vfs.c:1209
+ *     uart_driver_install(channel, 256, 0, 0, NULL, 0);
+ *                                      ^^^ RX ring   ^ TX ring = ZERO
+ *
+ * The console needs a driver to do its line editing, but allocates no TX ring
+ * because it writes through the ROM.  Consequences, both observed on this board:
+ *
+ *   - uart_write_bytes() fails with "uart driver error": the driver exists, but
+ *     there is no TX ring for it to queue into;
+ *   - uart_driver_install() here cannot help either: the port is taken, so it
+ *     returns ESP_ERR_INVALID_STATE.
+ *
+ * The reference port of this toy installs its own driver and both sends and reads;
+ * it can, because the ESP-IDF version it uses does NOT install a console driver
+ * (its console writes through the ROM).  That line cannot be copied here.
+ *
+ * So this port writes through the SAME path the console uses - the ROM's
+ * single-character transmitter, which waits for FIFO space and hands the byte to
+ * the hardware - and does not install a driver at all.  Two consequences worth
+ * stating plainly:
+ *
+ *   1. a frame can interleave with log text on the wire.  That was already true
+ *      (both share the pin); what is new is that a frame may appear in the middle
+ *      of a log line rather than between two of them.  The baseboard parses
+ *      "{AT+...}\r\n", so a frame that is intact as a substring still works.
+ *   2. RX stays with the console: the console's driver owns the RX ring, so base
+ *      replies are not readable from here.  Transmit-only is the honest
+ *      description, and b220_base_uart_read_pending() reports that rather than
+ *      pretending.
+ *
+ * esp_rom_output_tx_one_char() blocks only while the TX FIFO is full, and the FIFO
+ * is 128 bytes, so a whole frame is handed over in microseconds of CPU time in the
+ * normal case.  send() takes a semaphore around the frame so two tasks cannot
+ * interleave bytes of different frames.
+ */
 static bool s_ready = false;
 static bool s_rx_enabled = false;
 static SemaphoreHandle_t s_lock = NULL;
 static char s_last_tx[B220_BASE_LAST_MAX];
 static char s_last_rx[B220_BASE_LAST_MAX];
+
+/* Send one frame through the ROM transmitter.  Returns the number of bytes the
+ * hardware accepted (the frame length) or -1 when the FIFO never drained. */
+static int base_write_raw(const char* data, size_t len, uint32_t timeout_ms)
+{
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms == 0 ? 1 : timeout_ms);
+    const TickType_t start = xTaskGetTickCount();
+
+    for (size_t i = 0; i < len; i++) {
+        /* esp_rom_output_tx_one_char returns 0 on success.  It should not fail with
+         * the console UART configured, but if it does there is nothing useful to do
+         * except stop and say so, which the caller's short-write warning covers. */
+        if (esp_rom_output_tx_one_char((uint8_t)data[i]) != 0) {
+            return (int)i;
+        }
+        if (timeout_ms != 0 && (xTaskGetTickCount() - start) > timeout_ticks) {
+            /* Only reachable if the FIFO jammed: the call above waits for space, so
+             * normal frames never spend a tick here. */
+            return (int)i;
+        }
+    }
+    return (int)len;
+}
 
 /* The stop frames, byte-for-byte from ref/Flower_modou
  * (components/modou_ui_pages/src/base_board_test_page.cc, BASE_STOP_CMDS). */
@@ -93,33 +158,32 @@ esp_err_t b220_base_uart_init(bool consume_console_input)
         return err;
     }
 
-    if (consume_console_input && !uart_is_driver_installed(B220_BASE_UART_PORT)) {
-        /*
-         * The console normally owns UART0 through the ROM/log path, so the driver
-         * is usually already installed; installing it here is only for the case
-         * where it is not.  With CONFIG_ESP_CONSOLE_UART_DEFAULT the console
-         * driver is installed by the startup code, in which case s_rx_enabled
-         * simply becomes true and reads go to the same buffer the console uses.
-         */
-        err = uart_driver_install(B220_BASE_UART_PORT, B220_BASE_UART_RX_BUF,
-                                  B220_BASE_UART_TX_BUF, 0, NULL, 0);
-        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "uart_driver_install failed (%s); staying transmit-only",
-                     esp_err_to_name(err));
-            consume_console_input = false;
-        }
-    }
-
-    s_rx_enabled = consume_console_input && uart_is_driver_installed(B220_BASE_UART_PORT);
+    /*
+     * No uart_driver_install() here on purpose - see the block at the top of this
+     * file.  The console already owns UART0 on ESP-IDF 6.1, so an install would
+     * either be refused (ESP_ERR_INVALID_STATE) or, worse, replace the console's
+     * driver.  Frames go through the ROM transmitter instead.
+     *
+     * What is still worth checking is whether the console's RX ring exists at all,
+     * because that decides whether b220_base_uart_read_pending() can ever return
+     * anything.  It is the console's ring either way, so a base reply and a typed
+     * console command land in the same buffer.
+     */
+    const bool console_driver_present = uart_is_driver_installed(B220_BASE_UART_PORT);
+    s_rx_enabled = consume_console_input && console_driver_present;
     if (s_rx_enabled) {
+        /* Drop anything the console left behind, so a baseboard reply cannot be
+         * confused with stale input from boot. */
         uart_flush_input(B220_BASE_UART_PORT);
     }
     s_ready = true;
 
-    ESP_LOGI(TAG, "baseboard link up: UART0 TX GPIO%d / RX GPIO%d @ %d 8N1, %s",
+    ESP_LOGI(TAG, "baseboard link up: UART0 TX GPIO%d / RX GPIO%d @ %d 8N1, frames sent "
+                  "through the ROM transmitter (the console's driver has no TX ring, so the "
+                  "UART driver cannot be used here), %s",
              B220_BASE_UART_TX_GPIO, B220_BASE_UART_RX_GPIO, B220_BASE_UART_BAUD,
-             s_rx_enabled ? "replies readable (shares the console input)"
-                          : "transmit-only (the console keeps its input)");
+             s_rx_enabled ? "replies readable from the console's input ring"
+                          : "TRANSMIT-ONLY (the console owns the input ring)");
     return ESP_OK;
 }
 
@@ -138,14 +202,20 @@ esp_err_t b220_base_uart_send(const char* cmd, uint32_t tx_timeout_ms)
     if (s_lock != NULL && xSemaphoreTake(s_lock, pdMS_TO_TICKS(tx_timeout_ms + 100)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    const int written = uart_write_bytes(B220_BASE_UART_PORT, frame, strlen(frame));
-    if (written == (int)strlen(frame)) {
-        (void)uart_wait_tx_done(B220_BASE_UART_PORT, pdMS_TO_TICKS(tx_timeout_ms));
+    /*
+     * The frame goes out through the ROM transmitter, not uart_write_bytes(): see the
+     * block at the top of this file.  On IDF 6.1 the console installs the UART0
+     * driver with a ZERO-length TX ring, so uart_write_bytes() fails with
+     * "uart driver error" and no install of our own can replace it.
+     */
+    const int len = (int)strlen(frame);
+    const int written = base_write_raw(frame, (size_t)len, tx_timeout_ms);
+    if (written == len) {
         snprintf(s_last_tx, sizeof(s_last_tx), "%s", cmd);
         err = ESP_OK;
     } else {
-        ESP_LOGW(TAG, "baseboard write short (%d of %u bytes)", written,
-                 (unsigned)strlen(frame));
+        ESP_LOGW(TAG, "baseboard write short (%d of %d bytes) - the TX FIFO did not drain",
+                 written, len);
         err = ESP_FAIL;
     }
     if (s_lock != NULL) {
