@@ -649,11 +649,17 @@ esp_err_t b220_baseboard_move(const char* direction, int power, int duration_ms)
         return ESP_ERR_TIMEOUT;
     }
     /*
-     * The table's speed wins by default, and a caller-supplied one overrides it.  The
-     * override exists so the bench can test a speed without changing the table; the default
-     * exists because the table's value is what makes a turn turn.
+     * THE TABLE DECIDES THE SPEED.  A caller-supplied one is only used when it asks for
+     * something the table cannot express.
+     *
+     * An earlier version let any caller value override the table, and that is how "the
+     * movement got slower" happened: {BASE+MOVE,forward,200,...} replaced the table's 255
+     * with 200, and a value of 90 would have replaced it with 90 - turning a straight run
+     * into a crawl.  The table's numbers are what make a turn turn and a straight line
+     * straight, so a habit of passing a value must not override them.  The bench can still
+     * vary the speed with {BASE+RAW}, which builds its own frame and bypasses this path.
      */
-    if (power > 0 && power != B220_BASE_SPEED_DEFAULT) {
+    if (power > 0 && power != B220_BASE_SPEED_DEFAULT && table_speed == 0) {
         table_speed = (uint8_t)power;
     }
     snprintf(s_direction, sizeof(s_direction), "%s", direction);
