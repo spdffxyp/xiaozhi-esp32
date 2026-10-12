@@ -1363,21 +1363,94 @@ esp_err_t b220_base_uart_read_pending(char* rx, size_t rx_size, uint32_t timeout
 
 /* ------------------------------------------------------------- handshake --- */
 
-static void handshake_task(void* arg)
-{
+/*
+ * How often the baseboard is woken, in each of the two states.
+ *
+ * While nothing has answered, ask often enough that the log makes a disconnected baseboard
+ * obvious within a few seconds.  Once it has answered, back off: the command then only has to
+ * cover a possible brown-out, and the baseboard has no supply of its own to keep it alive through
+ * one.
+ */
+#define B220_BASE_UART_WAKE_SILENT_MS 3000
+#define B220_BASE_UART_WAKE_REPLY_MS 10000
+
+/*
+ * KEEP THE BASEBOARD AWAKE, THE WAY THE STOCK FIRMWARE DOES.
+ *
+ * This used to send AT+Pon exactly once, 3 s after boot, and delete the task; it was then changed
+ * to five attempts a second apart.  Neither is enough, and the reason is the hardware: THE
+ * BASEBOARD HAS NO POWER SUPPLY OF ITS OWN - it runs off the toy - so it can brown out and
+ * restart independently, at any time, not only at boot.  Whenever that happens the motors are
+ * locked again and the one command that unlocks them is long since sent and gone.  What that
+ * looks like on the bench is exactly what was reported: the lights still work, because they are
+ * applied by any later frame, while motion does nothing at all, forever.
+ *
+ * The stock firmware's own behaviour is the answer: it sends AT+Pon every few seconds even with
+ * no baseboard attached.  So this task does not finish.  It re-sends the wake command on a timer
+ * for the life of the device, and uses the baseboard's reply - which this link can read, because
+ * the console is off - to say whether anything is answering at all.
+ *
+ * Two intervals: while nothing has ever answered, ask often, because the device may simply not
+ * be attached and the log should make that obvious; once a reply has been seen, back off, because
+ * the baseboard is alive and the command only has to cover a possible later brown-out.
+ *
+ * The log is deliberately quiet after the first few attempts: a line every 3 s forever would
+ * bury everything else.
+ */
+#define B220_BASE_UART_WAKE_QUIET_EVERY 10 /* then one line per this many attempts */
+
+static void handshake_task(void* arg) {
     (void)arg;
     /* Let the ROM banner and the first log burst finish: they share the wire. */
     vTaskDelay(pdMS_TO_TICKS(B220_BASE_UART_HANDSHAKE_DELAY_MS));
 
-    ESP_LOGI(TAG, "baseboard handshake: sending AT+Pon (this is what unlocks the motors)");
-    const esp_err_t err = b220_base_uart_send("AT+Pon", 200);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "baseboard handshake failed (%s); motion commands may be ignored",
-                 esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "baseboard handshake sent");
+    bool heard_from_baseboard = false;
+    int attempts = 0;
+
+    for (;;) {
+        attempts++;
+        const esp_err_t err = b220_base_uart_send("AT+Pon", 200);
+
+        /*
+         * Listen before deciding what to say.  Whatever comes back is either an answer to this
+         * command or something the baseboard volunteered; both mean it is powered and talking,
+         * which is the fact worth having.
+         */
+        char rx[96] = {};
+        const esp_err_t rerr = b220_base_uart_read_pending(rx, sizeof(rx), 250);
+        const bool got_reply = (rerr == ESP_OK && rx[0] != '\0');
+
+        if (got_reply && !heard_from_baseboard) {
+            heard_from_baseboard = true;
+            ESP_LOGI(TAG, "baseboard is answering (first reply: \"%s\") - motors are unlocked",
+                     rx);
+        }
+
+        /* Report the first attempt, the first attempt that hears something, and then rarely. */
+        const bool talkative = (attempts <= 2) || (got_reply && attempts <= 3) ||
+                               (attempts % B220_BASE_UART_WAKE_QUIET_EVERY) == 0;
+        if (talkative) {
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "baseboard wake attempt %d could not be sent (%s)", attempts,
+                         esp_err_to_name(err));
+            } else if (heard_from_baseboard) {
+                ESP_LOGI(TAG,
+                         "baseboard wake attempt %d sent; last reply \"%s\" (the motors are "
+                         "unlocked, this keeps them that way across a baseboard restart)",
+                         attempts, rx);
+            } else {
+                ESP_LOGW(TAG,
+                         "baseboard wake attempt %d sent but nothing has answered yet - if this "
+                         "repeats, the baseboard is not powered or not connected (the toy's own "
+                         "power switch feeds it; it has no supply of its own)",
+                         attempts);
+            }
+        }
+
+        const int delay_ms = heard_from_baseboard ? B220_BASE_UART_WAKE_REPLY_MS
+                                                  : B220_BASE_UART_WAKE_SILENT_MS;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
-    vTaskDelete(NULL);
 }
 
 esp_err_t b220_base_uart_start_handshake(void)
