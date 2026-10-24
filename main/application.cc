@@ -64,7 +64,15 @@ void Application::Initialize() {
 
     // Setup the display
     auto display = board.GetDisplay();
-    display->SetupUI();
+    /*
+     * A board may have already built the UI when it brought the panel up, so that the
+     * initialising screen is visible while the audio system is still starting rather than
+     * leaving the panel blank for seconds. SetupUI() is idempotent, but checking first keeps
+     * the "called multiple times" warning out of the log for what is now a normal path.
+     */
+    if (!display->IsSetupUICalled()) {
+        display->SetupUI();
+    }
     // Print board name/version info
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 

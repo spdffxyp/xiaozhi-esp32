@@ -3740,6 +3740,26 @@ protected:
                                       DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                       DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
                                       DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+
+        /*
+         * SHOW THE INITIALISING SCREEN NOW, NOT WHEN THE APPLICATION GETS ROUND TO IT.
+         *
+         * Application::Initialize() calls SetupUI() too, but it does not run until this
+         * constructor has finished - and what runs in between is the ZL38063 bring-up.  That
+         * gap was measured on the bench: the panel is added at 1.25 s and the application's
+         * SetupUI() ran at 6.43 s, so for about five seconds the backlight was on while the
+         * panel had nothing drawn on it.  The user saw a grey screen with no sign that the
+         * device was busy, and the audio system is precisely what it was busy with.
+         *
+         * Nothing here waits for the assets: SetupUI() only reads the theme's fonts and colours,
+         * and the LcdDisplay constructor has already resolved the theme.  The application then
+         * skips its own call (it checks IsSetupUICalled()), so this is one setup, not two, and
+         * the duplicate-call warning does not appear in the boot log.
+         */
+        display_->SetupUI();
+        ESP_LOGI(TAG, "LCD up: the initialising screen is on the panel now, before the audio "
+                      "bring-up (it used to appear only after it, which left the panel blank "
+                      "for about five seconds)");
     }
 
 #if B220_AUDIO_BRINGUP
