@@ -428,6 +428,12 @@ choice BOARD_TYPE
     config BOARD_TYPE_SEEED_STUDIO_SENSECAP_WATCHER
         bool "Seeed Studio SenseCAP Watcher"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_SPDFF_BOARD
+        bool "SPDFF-BOARD"
+        depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_SPDFF_WIFIWALL
+        bool "SPDFF-WifiWall"
+        depends on IDF_TARGET_ESP32
     config BOARD_TYPE_SPOTPEAR_ESP32_S3_1_28_BOX
         bool "Spotpear ESP32-S3 1.28 Box"
         depends on IDF_TARGET_ESP32S3
@@ -634,12 +640,6 @@ choice BOARD_TYPE
         depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_ZHENGCHEN_CAM
         bool "Zhengchen AI Camera Wi-Fi (征辰科技)"
-        depends on IDF_TARGET_ESP32S3
-    config BOARD_TYPE_SPDFF_WIFIWALL
-        bool "SPDFF-WifiWall"
-        depends on IDF_TARGET_ESP32
-    config BOARD_TYPE_SPDFF_BOARD
-        bool "SPDFF-BOARD"
         depends on IDF_TARGET_ESP32S3
 endchoice
 
